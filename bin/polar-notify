@@ -16,7 +16,7 @@ Safety net (`rescue_revise`): a card still in `revise` whose session ended after
 instructions delivered once more (agent-bus resumes the session), so the change is not lost.
 State: ~/.local/state/polar-notify/state.json.
 """
-import json, os, re, subprocess, sys
+import json, os, re, shutil, subprocess, sys
 from datetime import datetime, timedelta, timezone
 
 HOME = os.path.expanduser("~")
@@ -30,6 +30,9 @@ DONE = {"sent", "chosen", "discarded", "expired", "failed", "answered", "skipped
 SKIP_PREFIX = ("agent-bus", "release-desk", "watchdog") + tuple(
     x.strip() for x in (os.environ.get("POLAR_NOTIFY_SKIP_EXTRA") or "").split(",") if x.strip())
 SID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+LIST_FAIL_ALARM = 3     # polar list fails this many runs in a row: alarm (one failure is noise)
+BUS_AWAY_ALARM_MIN = 30  # an answer the bus could not take for this long: alarm
+RESCUE_FAIL_ALARM = 3    # rescue_revise fails this many runs in a row: alarm
 MAX_TRIES = 20  # a card agent-bus keeps refusing (not «bus away») goes to the router after this many runs
 
 
@@ -65,6 +68,29 @@ def on_server(cmd, timeout=30):
         return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None
+
+
+def alarm(key, title, text=""):
+    """Loud channel that does not need Polar (the harness-alarm tool). Never raises. True when a channel took it.
+    HARNESS_ALARM=0 turns it off; HARNESS_ALARM_BIN sets the tool path."""
+    if os.environ.get("HARNESS_ALARM") == "0":
+        return False
+    bin_ = (os.environ.get("HARNESS_ALARM_BIN") or shutil.which("harness-alarm")
+            or os.path.join(HOME, ".local/bin/harness-alarm"))
+    try:
+        cmd = [bin_, "--key", key, "--title", title] + (["--text", text[:300]] if text else [])
+        return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
+    except Exception:
+        return False
+
+
+def streak(st, name, bad, limit, title, text=""):
+    """Count runs in a row where `bad` is true (st[name]). Alarm from `limit`. A good run resets it. Returns the count."""
+    n = st.get(name, 0) + 1 if bad else 0
+    st[name] = n
+    if n >= limit:
+        alarm("polar-notify:" + name, title, text or f"{n} times in a row")
+    return n
 
 
 def load():
@@ -351,6 +377,10 @@ def main():
         save(st)  # fix the starting point, so no answer falls between two runs
     since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     reqs = polar_list(since)
+    streak(st, "list_fails", reqs is None, LIST_FAIL_ALARM, "polar-notify cannot read Polar",
+           "polar list fails: the owner's answers do not reach the sessions")
+    if reqs is None:
+        save(st)
     if reqs is not None:
         pending = st.setdefault("pending", {})
         for k, v in list(pending.items()):
@@ -396,6 +426,11 @@ def main():
             if not done:
                 p = pending.setdefault(r["id"], {"at": r.get("decided_at"), "tries": 0})
                 p["tries"] += 1
+                if msg.startswith("bus away"):  # waits without limit by design: a long wait must be loud
+                    age = iso_age(p.get("at"), datetime.now(timezone.utc))
+                    if age is not None and age > BUS_AWAY_ALARM_MIN * 60:
+                        alarm("polar-notify:bus-away", "An answer does not reach its session: the bus does not answer",
+                              f"Card {r['id']} not delivered for more than {BUS_AWAY_ALARM_MIN} min")
                 if p["tries"] >= MAX_TRIES and not msg.startswith("bus away"):
                     note = f"- {r.get('decided_at')} Polar {r['id']} «{r['title']}» {r['status']} — not delivered: {msg}"
                     rc, _ = bus("deliver", "router", "--text-file", "-", stdin=note)
@@ -408,10 +443,14 @@ def main():
             save(st)
         save(st)  # also when only a stale pending card left
         try:
-            for note in rescue_revise(reqs, st):
+            notes = rescue_revise(reqs, st)
+            for note in notes:
                 print(note)
+            streak(st, "rescue_fails", any(" failed (" in n for n in notes), RESCUE_FAIL_ALARM,
+                   "A revise answer does not reach a closed session", "rescue_revise fails several runs in a row")
         except Exception as e:  # the safety net must never stop the run
             print(f"rescue error: {type(e).__name__}: {e}")
+            streak(st, "rescue_fails", True, RESCUE_FAIL_ALARM, "A revise answer does not reach a closed session", str(e))
         save(st)
     rc, out = bus("pull", "--max", "5", "--budget", "40")
     if out and out != "nothing to deliver":

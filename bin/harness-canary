@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""harness-canary: an hourly end-to-end test of the delivery chain. Run it on the server (cron or launchd, hourly).
+
+  harness-canary           run one check
+  harness-canary --reader  the line reader that plays the session "canary" in tmux (it draws a Claude Code style
+                           input box, so herdr-deliver types into it like into a real session)
+
+Steps, each timed and written to <state>/last.json:
+  session   tmux "canary" runs the reader; the bus knows the session (agent-bus register)
+  card      `polar ask decision --canary` makes a 2-option card (the real CLI)
+  visible   optional: a command checks that your web app can read the card (HARNESS_CANARY_MANDO_STORE_CMD)
+  answer    POST /act {choose} to the approval app's web API with a Bearer token, like your web app does
+            (needs HARNESS_CANARY_POLAR_API and HARNESS_CANARY_TOKEN; without them the answer and delivery steps
+            are skipped, not failed)
+  delivery  polar-notify hands the answer to the session: the line reaches <state>/inbox (up to 90 s)
+  push      optional: a command checks that push notifications work (HARNESS_CANARY_MANDO_PUSH_CMD)
+A step that is not set up is recorded as skipped and does not fail the check.
+A failed step calls harness-alarm with key canary:<step>. A card that is still open is discarded at the end.
+Env: HARNESS_CANARY_DIR, POLAR_BIN, AGENT_BUS_BIN, HARNESS_CANARY_TMUX, HARNESS_CANARY_HOST (the host name the bus
+knows the canary session by; default AGENT_BUS_SERVER_HOST, else `server`), HARNESS_CANARY_POLAR_API,
+HARNESS_CANARY_TOKEN (token file), HARNESS_CANARY_MANDO_STORE_CMD (run as `<cmd> canary-visible <card id>`),
+HARNESS_CANARY_MANDO_PUSH_CMD (run as `<cmd> health`), HARNESS_CANARY_MANDO_CWD, HARNESS_CANARY_WAIT (seconds,
+default 90), HARNESS_CANARY_SHOWN_WAIT (seconds, default 45), HARNESS_ALARM_BIN. Python 3 standard library only.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+BIN = os.path.dirname(os.path.realpath(__file__))
+SID = "ca4a2e00-0000-4000-8000-0000000000c1"   # one fixed session: the bus row is reused, never grows
+PLACE = "canary"
+STEPS = ("session", "card", "visible", "answer", "delivery", "push")
+
+
+def env(name, default):
+    return os.environ.get(name) or default
+
+
+def state_dir():
+    return env("HARNESS_CANARY_DIR", os.path.join(HOME, ".local/state/harness-canary"))
+
+
+def sh(cmd, timeout=60, cwd=None, stdin=None):
+    """(exit code, stdout+stderr). Never raises."""
+    try:
+        # PYTHONWARNINGS: a library warning (urllib3 on LibreSSL) must not fill the alarm text
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, input=stdin,
+                           env=dict(os.environ, PYTHONWARNINGS="ignore"))
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except Exception as e:
+        return 255, "%s: %s" % (type(e).__name__, e)
+
+
+def alarm(key, title, text):
+    bin_ = env("HARNESS_ALARM_BIN", os.path.join(BIN, "harness-alarm"))
+    return sh([bin_, "--key", key, "--title", title, "--text", text[:300], "--repeat-min", "120"],
+              timeout=90)[0] == 0
+
+
+def optional_cmd(var):
+    """(argv, cwd) of an optional command, or (None, None) when the setting is empty."""
+    raw = os.environ.get(var) or ""
+    cwd = os.environ.get("HARNESS_CANARY_MANDO_CWD") or ""
+    return (shlex.split(raw) if raw.strip() else None), (cwd if os.path.isdir(cwd) else None)
+
+
+# ---- the reader (plays a Claude Code session)
+RULE = "─" * 40
+
+
+def reader():
+    inbox = os.path.join(state_dir(), "inbox")
+    os.makedirs(state_dir(), exist_ok=True)
+    while True:
+        # top rule, the «❯» line, bottom rule; then back up to the «❯» line. herdr-deliver finds this box.
+        sys.stdout.write("\x1b[2J\x1b[H%s\n❯ \n%s\x1b[A\x1b[3G" % (RULE, RULE))
+        sys.stdout.flush()
+        line = sys.stdin.readline()
+        if not line:
+            time.sleep(1)
+            continue
+        with open(inbox, "a") as f:
+            f.write(line.rstrip("\n") + "\n")
+
+
+# ---- steps
+class Check:
+    def __init__(self):
+        self.d = state_dir()
+        os.makedirs(self.d, exist_ok=True)
+        self.polar = env("POLAR_BIN", "polar")
+        sibling = os.path.join(BIN, "agent-bus")
+        self.bus = env("AGENT_BUS_BIN", sibling if os.path.exists(sibling) else "agent-bus")
+        self.tmux = env("HARNESS_CANARY_TMUX", "tmux")
+        self.host = env("HARNESS_CANARY_HOST", env("AGENT_BUS_SERVER_HOST", "server"))
+        self.steps = {}
+        self.card = None
+        self.stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.marker = "canary-" + str(int(time.time()))
+
+    def record(self, name, ok, t0, err=""):
+        self.steps[name] = {"ok": ok, "at": time.strftime("%Y-%m-%dT%H:%M:%S"), "ms": int((time.time() - t0) * 1000),
+                            **({"error": err[:300]} if err else {})}
+        if not ok:
+            alarm("canary:" + name, "Canary: step \"%s\" failed" % name, err or "no detail")
+        return ok
+
+    def skip(self, name, why, ok=False):
+        """ok=False: a step that could not run because an earlier one failed. ok=True: not set up here."""
+        self.steps[name] = {"ok": ok, "skipped": why, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+    def step_session(self):
+        t0 = time.time()
+        if sh([self.tmux, "has-session", "-t", "=" + PLACE])[0] != 0:
+            rc, out = sh([self.tmux, "new-session", "-d", "-s", PLACE, "-x", "100", "-y", "30",
+                          "%s %s --reader" % (shlex.quote(sys.executable), shlex.quote(os.path.realpath(__file__)))])
+            if rc != 0:
+                return self.record("session", False, t0, "tmux new-session: " + out)
+        rc, out = sh([self.bus, "register", "--session", SID, "--host", self.host, "--tmux", PLACE,
+                      "--title", "canary (automatic test)"])
+        return self.record("session", rc == 0, t0, "agent-bus register: " + out if rc else "")
+
+    def step_card(self):
+        t0 = time.time()
+        rc, out = sh([self.polar, "ask", "decision", "--title", "canary " + self.marker,
+                      "--context", "automatic delivery test, nobody needs to see it", "--option", "yes:Yes", "--option", "no:No",
+                      "--requester", "%s %s" % (SID, PLACE), "--canary"])
+        try:
+            self.card = json.loads(out.splitlines()[-1])["id"] if rc == 0 else None
+        except (ValueError, KeyError, IndexError):
+            self.card = None
+        return self.record("card", bool(self.card), t0, "" if self.card else "polar ask: %s" % out[-200:])
+
+    def step_visible(self):
+        t0 = time.time()
+        cmd, cwd = optional_cmd("HARNESS_CANARY_MANDO_STORE_CMD")
+        if cmd is None:
+            self.skip("visible", "not set up", ok=True)
+            return True
+        rc, out = 1, ""
+        for _ in range(6):  # Polar's own tick may need a moment to move the card
+            rc, out = sh(cmd + ["canary-visible", self.card], cwd=cwd, timeout=30)
+            if rc == 0:
+                break
+            time.sleep(2)
+        return self.record("visible", rc == 0, t0, "" if rc == 0 else "the web app does not read the card: " + out)
+
+    def step_answer(self):
+        # Polar shows a new card on its next delivery tick (5 s); until then the card is «pending» and /act
+        # answers 409. Try again quietly while it is pending; record (and alarm) once at the end.
+        t0 = time.time()
+        wait = float(env("HARNESS_CANARY_SHOWN_WAIT", "45"))
+        while True:
+            ok, err = self._answer_once()
+            if ok or '"status": "pending"' not in err or time.time() - t0 > wait:
+                return self.record("answer", ok, t0, err)
+            time.sleep(3)
+
+    def _answer_once(self):
+        """(ok, error text). Never raises."""
+        api = env("HARNESS_CANARY_POLAR_API", "").rstrip("/")
+        try:
+            tok = open(env("HARNESS_CANARY_TOKEN", "")).read().strip()
+            req = urllib.request.Request(api + "/act", method="POST",
+                                         data=json.dumps({"id": self.card, "action": "choose", "option": "yes"}).encode(),
+                                         headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = json.loads(r.read().decode() or "{}")
+            ok = bool(body.get("ok", True))
+            return ok, "" if ok else "web API: %s" % json.dumps(body)[:200]
+        except urllib.error.HTTPError as e:  # the body says why (409: the card is closed or of another kind)
+            try:
+                why = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                why = ""
+            return False, "web API: HTTP %s %s" % (e.code, why)
+        except Exception as e:
+            return False, "web API: %s %s" % (type(e).__name__, str(e)[:150])
+
+    def step_delivery(self):
+        t0 = time.time()
+        inbox = os.path.join(self.d, "inbox")
+        end = time.time() + float(env("HARNESS_CANARY_WAIT", "90"))
+        while True:
+            try:
+                if self.card in open(inbox).read():
+                    return self.record("delivery", True, t0)
+            except OSError:
+                pass
+            if time.time() >= end:
+                return self.record("delivery", False, t0, "the answer did not reach the session in time")
+            time.sleep(2)
+
+    def step_push(self):
+        t0 = time.time()
+        cmd, cwd = optional_cmd("HARNESS_CANARY_MANDO_PUSH_CMD")
+        if cmd is None:
+            self.skip("push", "not set up", ok=True)
+            return True
+        rc, out = sh(cmd + ["health"], cwd=cwd, timeout=30)
+        return self.record("push", rc == 0, t0, "" if rc == 0 else "push health: " + out)
+
+    def cleanup(self):
+        if self.card:  # an answered card is closed; a card that is still open is withdrawn
+            sh([self.polar, "discard", self.card])
+        try:  # keep the inbox small
+            lines = open(os.path.join(self.d, "inbox")).read().splitlines()[-50:]
+            open(os.path.join(self.d, "inbox"), "w").write("\n".join(lines) + ("\n" if lines else ""))
+        except OSError:
+            pass
+
+    def run(self):
+        t0 = time.time()
+        can_answer = bool(os.environ.get("HARNESS_CANARY_POLAR_API") and os.environ.get("HARNESS_CANARY_TOKEN"))
+        if self.step_session():
+            if self.step_card():
+                if self.step_visible():
+                    if can_answer:
+                        self.step_answer() and self.step_delivery()
+                    else:
+                        for n in ("answer", "delivery"):
+                            self.skip(n, "no web API or token set up", ok=True)
+                else:
+                    self.skip("answer", "card not visible")
+                    self.skip("delivery", "card not visible")
+            else:
+                for n in ("visible", "answer", "delivery"):
+                    self.skip(n, "no card")
+        else:
+            for n in ("card", "visible", "answer", "delivery"):
+                self.skip(n, "no session")
+        self.step_push()
+        self.cleanup()
+        ok = all(self.steps.get(n, {}).get("ok") for n in STEPS)
+        last = {"started": self.stamp, "ok": ok, "seconds": int(time.time() - t0), "steps": self.steps}
+        tmp = os.path.join(self.d, "last.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(last, f, indent=1)
+        os.replace(tmp, os.path.join(self.d, "last.json"))
+        return ok
+
+
+def main(argv):
+    if argv[:1] == ["--reader"]:
+        reader()
+        return 0
+    try:
+        return 0 if Check().run() else 1
+    except Exception as e:  # the canary itself broke: that is a failure too
+        alarm("canary:crash", "Canary: the check crashed", "%s: %s" % (type(e).__name__, e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""harness-alarm: make one delivery failure loud, through a channel that does not use Polar.
+
+  harness-alarm --key K --title T [--text X] [--repeat-min 60]
+
+Order of channels:
+  server (agent-bus role server): 1. push command (if set)   2. Slack DM from a bot token file (if set up)
+                                  3. osascript (logged, NOT counted as sent: nobody looks at the server screen,
+                                  so the caller tries again)
+  laptop (any other role):        1. the same command on the server over ssh   2. osascript here
+A key that was SENT OK is silent for --repeat-min minutes. A failed send is tried again on the next call.
+Every call appends one JSON line to <state>/log. Exit 0 when a channel worked (or the key is in its quiet time),
+1 when none did. It never raises. HARNESS_ALARM=0 turns it off (tests).
+
+Env (all optional):
+  HARNESS_ALARM_STATE_DIR    default ~/.local/state/harness-alarm
+  HARNESS_ALARM_PUSH_CMD     push command prefix; `send --title T --body B --url /` is added. Unset: no push channel.
+  HARNESS_ALARM_PUSH_CWD     where that command runs (default: the current folder)
+  HARNESS_ALARM_SSH_CMD      ssh prefix for the laptop (default: ssh -o BatchMode=yes -o ConnectTimeout=8
+                             $AGENT_BUS_SERVER_HOST, where that host defaults to `server`)
+  HARNESS_ALARM_OSASCRIPT    default /usr/bin/osascript
+  HARNESS_ALARM_SLACK_TOKEN_FILE  Slack bot token file, must be mode 0600
+                             (default ~/.config/harness-alarm/slack-token; a missing file means no Slack channel)
+  HARNESS_ALARM_SLACK_CHANNEL     DM channel id; else the file ~/.config/harness-alarm/slack-channel
+                             (a missing channel means no Slack channel)
+  HARNESS_ALARM_SLACK_URL         default https://slack.com/api/chat.postMessage (tests)
+Python 3 standard library only.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import urllib.request
+
+HOME = os.path.expanduser("~")
+
+
+def state_dir():
+    return os.environ.get("HARNESS_ALARM_STATE_DIR") or os.path.join(HOME, ".local/state/harness-alarm")
+
+
+def role():
+    r = os.environ.get("AGENT_BUS_ROLE")
+    if r is None:
+        try:
+            r = open(os.path.join(HOME, ".config/agent-bus/role")).read().strip()
+        except OSError:
+            r = ""
+    return r or "local"
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path, st):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, path)
+
+
+def log_line(d, entry):
+    try:
+        with open(os.path.join(d, "log"), "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def run(cmd, cwd=None, timeout=45):
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=timeout, cwd=cwd).returncode
+    except Exception:
+        return 255
+
+
+def push(title, text):
+    raw = os.environ.get("HARNESS_ALARM_PUSH_CMD")
+    if not raw:
+        return False  # no push command set: skip this channel
+    cwd = os.environ.get("HARNESS_ALARM_PUSH_CWD") or ""
+    return run(shlex.split(raw) + ["send", "--title", title, "--body", text, "--url", "/"],
+               cwd=cwd if os.path.isdir(cwd) else None) == 0
+
+
+def over_ssh(key, title, text, repeat_min):
+    host = os.environ.get("AGENT_BUS_SERVER_HOST") or "server"
+    raw = os.environ.get("HARNESS_ALARM_SSH_CMD") or "ssh -o BatchMode=yes -o ConnectTimeout=8 " + shlex.quote(host)
+    remote = "harness-alarm --key %s --title %s --text %s --repeat-min %d" % (
+        shlex.quote(key), shlex.quote(title), shlex.quote(text), repeat_min)
+    return run(shlex.split(raw) + ["PATH=$HOME/.local/bin:$PATH " + remote], timeout=60) == 0
+
+
+def slack_dm(title, text):
+    """Post a DM with a Slack bot token from a file. Independent of the Polar process. Never prints the token."""
+    try:
+        tf = os.environ.get("HARNESS_ALARM_SLACK_TOKEN_FILE") or os.path.join(HOME, ".config/harness-alarm/slack-token")
+        if os.stat(tf).st_mode & 0o077:
+            return False
+        token = open(tf).read().strip()
+        ch = os.environ.get("HARNESS_ALARM_SLACK_CHANNEL")
+        if not ch:
+            ch = open(os.path.join(HOME, ".config/harness-alarm/slack-channel")).read().strip()
+        if not token or not ch:
+            return False
+        body = json.dumps({"channel": ch, "text": ":rotating_light: *%s*\n%s" % (title, text)}).encode()
+        url = os.environ.get("HARNESS_ALARM_SLACK_URL") or "https://slack.com/api/chat.postMessage"
+        req = urllib.request.Request(url, data=body, headers={
+            "Authorization": "Bearer " + token, "Content-Type": "application/json; charset=utf-8"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return bool(json.load(r).get("ok"))
+    except Exception:
+        return False
+
+
+def notify(title, text):
+    msg = (title + ". " + text).replace('"', "'").replace("\\", "")[:230]
+    osa = os.environ.get("HARNESS_ALARM_OSASCRIPT") or "/usr/bin/osascript"
+    return run([osa, "-e", 'display notification "%s" with title "harness alarm"' % msg], timeout=15) == 0
+
+
+def alarm(key, title, text="", repeat_min=60):
+    """Return (ok, how). Never raises."""
+    if os.environ.get("HARNESS_ALARM") == "0":
+        return True, "off"
+    d = state_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    sp = os.path.join(d, "state.json")
+    st = load_state(sp)
+    now = time.time()
+    last = st.get(key)
+    if isinstance(last, (int, float)) and now - last < repeat_min * 60:
+        log_line(d, {"t": int(now), "key": key, "how": "suppressed"})
+        return True, "suppressed"
+    how = None
+    server = role() == "server"
+    if server:
+        if push(title, text):
+            how = "push"
+        elif slack_dm(title, text):
+            how = "slack"
+    elif over_ssh(key, title, text, repeat_min):
+        how = "ssh"
+    if how is None:
+        shown = notify(title, text)
+        if shown and not server:
+            how = "osascript"  # the laptop screen is watched; the server screen is not, so there it stays a failure
+    if how:
+        st[key] = now
+        try:
+            save_state(sp, st)
+        except OSError:
+            pass
+    log_line(d, {"t": int(now), "key": key, "title": title, "text": text[:300], "how": how or "FAILED"})
+    return how is not None, how or "failed"
+
+
+def main(argv):
+    try:
+        a = {"repeat-min": 60, "text": ""}
+        i = 0
+        while i < len(argv):
+            if argv[i].startswith("--") and i + 1 < len(argv):
+                a[argv[i][2:]] = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+        if not a.get("key") or not a.get("title"):
+            print("usage: harness-alarm --key K --title T [--text X] [--repeat-min 60]", file=sys.stderr)
+            return 2
+        ok, how = alarm(a["key"], a["title"], a["text"], int(a["repeat-min"]))
+        print(how)
+        return 0 if ok else 1
+    except Exception:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

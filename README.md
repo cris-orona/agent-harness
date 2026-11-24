@@ -91,6 +91,44 @@ choice into the session that asked (through `agent-bus deliver`). A parked sessi
 Types a message into a Claude Code pane or tmux session and makes sure it is submitted, without clobbering text
 the owner is typing. `agent-bus` uses it.
 
+### harness-alarm
+Makes one delivery failure loud through a channel that does not use Polar, so a broken approval app cannot hide
+its own failure. On the server it tries a push command, then a Slack DM from a bot token file. On a laptop it runs
+the same command on the server over ssh, then a local notification. A key that was sent is quiet for
+`--repeat-min` minutes (default 60); a failed send is tried again on the next call. Every call writes one line to a
+log. `agent-bus` and `polar-notify` call it after repeated failures (for example `polar list` fails 3 runs in a
+row). `HARNESS_ALARM=0` turns it off.
+
+```
+harness-alarm --key polar-down --title "Polar is down" --text "polar list failed 3 times" --repeat-min 60
+```
+
+### harness-canary
+An hourly end-to-end test of the whole chain (run it on the server from cron or launchd). It plays a session in
+tmux, asks a 2-option card with `polar ask decision --canary`, answers it through the approval app's web API, and
+checks that polar-notify types the answer into the session. A failed step calls `harness-alarm` with the key
+`canary:<step>`. Optional steps (the web app can read the card, push works) are skipped when their command is not
+set. The result of the last run is in `<state>/last.json`. `harness-canary --reader` is the fake session it starts.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `HARNESS_ALARM` | `0` turns harness-alarm off | on |
+| `HARNESS_ALARM_BIN` | path of harness-alarm (agent-bus, polar-notify, canary) | `harness-alarm` on PATH, else `~/.local/bin/harness-alarm` |
+| `HARNESS_ALARM_STATE_DIR` | quiet-time state and log | `~/.local/state/harness-alarm` |
+| `HARNESS_ALARM_PUSH_CMD` | push command prefix (gets `send --title T --body B --url /`) | none: no push channel |
+| `HARNESS_ALARM_PUSH_CWD` | folder where the push command runs | current folder |
+| `HARNESS_ALARM_SSH_CMD` | ssh prefix the laptop uses to reach the server | `ssh -o BatchMode=yes ... $AGENT_BUS_SERVER_HOST` |
+| `HARNESS_ALARM_SLACK_TOKEN_FILE` | Slack bot token file (mode 0600) | `~/.config/harness-alarm/slack-token` |
+| `HARNESS_ALARM_SLACK_CHANNEL` | Slack DM channel id, or the file `~/.config/harness-alarm/slack-channel` | none: no Slack channel |
+| `HARNESS_CANARY_DIR` | canary state folder | `~/.local/state/harness-canary` |
+| `HARNESS_CANARY_TMUX` | tmux binary | `tmux` |
+| `HARNESS_CANARY_HOST` | host name the bus knows the canary session by | `AGENT_BUS_SERVER_HOST`, else `server` |
+| `HARNESS_CANARY_POLAR_API`, `HARNESS_CANARY_TOKEN` | web API URL and token file used to answer the card | none: answer and delivery steps skipped |
+| `HARNESS_CANARY_MANDO_STORE_CMD` | command run as `<cmd> canary-visible <card id>` | none: step skipped |
+| `HARNESS_CANARY_MANDO_PUSH_CMD` | command run as `<cmd> health` | none: step skipped |
+| `HARNESS_CANARY_MANDO_CWD` | folder where those two commands run | current folder |
+| `HARNESS_CANARY_WAIT`, `HARNESS_CANARY_SHOWN_WAIT` | seconds to wait for delivery (90) and for the card to be shown (45) | 90, 45 |
+
 ### Release desk (docs/release-desk.md)
 Not code: a contract for one long-lived agent session. It owns every `staging` to `main` promotion. Feature
 sessions only merge into `staging` and leave `release-desk:` comments on their PR.
@@ -139,8 +177,9 @@ an approval app with a `polar`-like CLI.
 ```
 python3 -m venv .venv && .venv/bin/python -m unittest discover -s tests
 ```
-496 tests (agent-bus, polar-notify, herdr-deliver) pass on my machine. They use a temp database and fakes. They
-never reach a server.
+552 tests pass on my machine. They use a temp database and fakes. They never reach a server. `tests/_isolate.py`
+puts a fake `polar` first on PATH and blocks the real one, so a test that calls Polar without its own stub fails
+instead of sending a real card. Alarm settings point at nothing, so no test sends a push or a Slack message.
 
 ## Known rough edges
 

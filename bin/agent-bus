@@ -1178,6 +1178,47 @@ def log_line(msg):
     print(f"agent-bus: {msg}", file=sys.stderr)
 
 
+def harness_alarm(key, title, text=""):
+    """Loud failure channel that does not depend on Polar (the harness-alarm tool). Never raises.
+    True when a channel took it. HARNESS_ALARM=0 turns it off; HARNESS_ALARM_BIN sets the tool path."""
+    if os.environ.get("HARNESS_ALARM") == "0":
+        return False
+    bin_ = (os.environ.get("HARNESS_ALARM_BIN") or shutil.which("harness-alarm")
+            or os.path.expanduser("~/.local/bin/harness-alarm"))
+    try:
+        cmd = [bin_, "--key", key, "--title", title] + (["--text", text[:300]] if text else [])
+        return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
+    except Exception:
+        return False
+
+
+def fail_streak(key, ok, limit, title="", text=""):
+    """Count failures in a row for `key` (file fail-streaks.json beside the bus db). One failure is not an alarm:
+    from `limit` in a row, harness_alarm fires (it holds its own repeat window). A success resets the count.
+    Returns the streak. Never raises."""
+    path = os.path.join(os.path.dirname(db_path()), "fail-streaks.json")
+    try:
+        try:
+            with open(path) as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            st = {}
+        n = 0 if ok else int(st.get(key, 0)) + 1
+        if ok:
+            st.pop(key, None)
+        else:
+            st[key] = n
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(st, fh)
+        os.replace(tmp, path)
+        if n >= limit:
+            harness_alarm("agent-bus:" + key, title or ("agent-bus: repeated failure " + key), text or f"{n} failures in a row")
+        return n
+    except Exception:
+        return 0
+
+
 def tab_position(tab_id):
     """The tab's number as the owner sees it (1-based, in its workspace, router/desk tabs not counted). None on error."""
     try:
@@ -1203,10 +1244,13 @@ def polar_wake_card(title, context, plain, body=None):
                                input=body, capture_output=True, text=True, timeout=30)
         except Exception as e:
             log_line(f"polar card «{title}» failed: {e}")
+            fail_streak("polar-wake-card", False, 2, "Polar does not take the bus cards", f"{type(e).__name__}: {e}")
             return False
         if p.returncode == 0:
+            fail_streak("polar-wake-card", True, 2)
             return True
         log_line(f"polar card «{title}» refused ({p.returncode}): {((p.stderr or '') + ' ' + (p.stdout or '')).strip()[:300]}")
+    fail_streak("polar-wake-card", False, 2, "Polar does not take the bus cards", f"Last card: «{title}»")
     return False
 
 
@@ -1329,8 +1373,7 @@ def polar_open_ids(sid):
     """Ids of this session's Polar cards that wait for the owner (pending, shown). Raises on failure.
     Not `revise`: the owner already answered it («Pedir cambios» or a follow-up), so a wait on it is never met
     (owner, 2026-11-24: «dicen esperando tarjeta, pero ya completé todas»)."""
-    import shutil
-    polar = shutil.which("polar") or os.path.expanduser("~/.local/bin/polar")
+    polar = polar_bin()
     r = subprocess.run([polar, "list", "--status", "open"], capture_output=True, text=True, timeout=20)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or "polar failed").strip()[:120])
@@ -1354,8 +1397,7 @@ def polar_owner_ids(sid):
     cards is in `revise` (the owner pressed «Pedir cambios»): the next step is the session's, so it must not park.
     A report card is no ask: the session that sent it has finished, and a park on it would resume a finished session
     when the owner closes the report."""
-    import shutil
-    polar = shutil.which("polar") or os.path.expanduser("~/.local/bin/polar")
+    polar = polar_bin()
     r = subprocess.run([polar, "list", "--status", "open"], capture_output=True, text=True, timeout=20)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or "polar failed").strip()[:120])
@@ -1399,6 +1441,8 @@ def initiative_set(c, slug, sid=None, title=None, pmo=None, state=None, next_ste
             return 2, "agent-bus: the note is empty. Say what is done, what is left and who has the next step."
         if title is not None and not title.strip():
             return 2, "agent-bus: --title is empty."
+        if state and state != "waiting" and waits_on is None:
+            waits_on = ""  # it moves again: an old wait (often a closed card) must not stay on Home as a wait
         for col, v in (("title", title), ("pmo", pmo), ("state", state), ("next_step", next_step), ("waits_on", waits_on)):
             if v is not None:
                 c.execute(f"UPDATE initiatives SET {col}=? WHERE slug=?", (v.strip(), slug))
@@ -1955,7 +1999,8 @@ def long_wait_card(about, first):
 
 
 def polar_bin():
-    """polar on PATH, else ~/.local/bin/polar (launchd runs of due() have a short PATH)."""
+    """polar on PATH, else ~/.local/bin/polar (launchd runs of due() have a short PATH). Every local polar call
+    goes through here, so a test can put a fake first on PATH and no test sends a real card."""
     return shutil.which("polar") or os.path.expanduser("~/.local/bin/polar")
 
 
@@ -3997,12 +4042,14 @@ def reap_taken_over(c, panes=None, agents=None):
 
 def laptop_polar_notice(title, body, sid):
     """Laptop: one Polar report card with the laptop `polar` CLI. True when sent."""
-    polar = shutil.which("polar") or os.path.expanduser("~/.local/bin/polar")
+    polar = polar_bin()
     try:
         p = subprocess.run([polar, "report", "--title", title, "--text-file", "-", "--requester", sid], input=body,
                            capture_output=True, text=True, timeout=40)
+        fail_streak("laptop-polar-notice", p.returncode == 0, 2, "Polar does not take the laptop notices", (p.stderr or "")[-200:])
         return p.returncode == 0
-    except Exception:
+    except Exception as e:
+        fail_streak("laptop-polar-notice", False, 2, "Polar does not take the laptop notices", str(e))
         return False
 
 
@@ -4028,8 +4075,10 @@ def polar_notice(title, body, sid, silent=False):
            + shlex_quote(sid) + (" " + POLAR_SILENT if silent else ""))
     try:
         p = subprocess.run(["/bin/sh", "-c", cmd], input=body, capture_output=True, text=True, timeout=40)
+        fail_streak("polar-notice", p.returncode == 0, 2, "Polar does not take the bus notices", (p.stderr or "")[-200:])
         return p.returncode == 0
-    except Exception:
+    except Exception as e:
+        fail_streak("polar-notice", False, 2, "Polar does not take the bus notices", str(e))
         return False
 
 
@@ -4546,6 +4595,9 @@ def delivery_alarm(c, now_s=None):
         with c:
             event(c, sid, "delivery-alarm", {"delivery": first, "sent": bool(sent), "count": len(ds)})
         log_line(f"delivery alarm {sid[:8]}: {len(ds)} open, card {'sent' if sent else 'NOT sent'}")
+        if not sent:  # the card is the only way the owner learns of stuck messages: use the channel that needs no Polar
+            harness_alarm("agent-bus:delivery-alarm-card:" + sid[:8], "Undelivered messages and Polar does not take the card",
+                          f"{clip_text(title, 80)}: {len(ds)} message(s) older than {DELIVERY_ALARM_MIN} min")
         told.append(sid)
     return told
 

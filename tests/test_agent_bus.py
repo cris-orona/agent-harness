@@ -210,13 +210,19 @@ class ParkTest(BusBase):
 
     def test_park_refuses_dirty_then_allows(self):
         self.repo(dirty=True)
+        quiet = os.path.join(self.tmp.name, 'quiet-bin')  # the CLI lists open Polar cards first: an empty list
+        os.makedirs(quiet)
+        with open(os.path.join(quiet, 'polar'), 'w') as fh:
+            fh.write('#!/bin/sh\nexit 0\n')
+        os.chmod(os.path.join(quiet, 'polar'), 0o755)
+        env = dict(os.environ, PATH=quiet + os.pathsep + os.environ['PATH'])
         r = subprocess.run([sys.executable, str(PATH), 'park', '--session', A, '--wait', 'person:Alex', '--about', 'x', '--note-file', '-'],
-                           input='n', capture_output=True, text=True, timeout=5)
+                           input='n', capture_output=True, text=True, timeout=5, env=env)
         self.assertEqual(r.returncode, 2)
         self.assertIn('uncommitted', r.stderr)
         self.assertIsNone(self.c.execute('SELECT parked_at FROM sessions WHERE session_id=?', (A,)).fetchone()[0])
         calls = self.fake_herdr()
-        code, msg = bus.park(self.c, A, ['person:Alex'], 'x', 'note', allow_dirty=True)
+        code, msg = bus.park(self.c, A, ['person:Alex'], 'x', 'note', allow_dirty=True, polar_fn=lambda sid: [])
         self.assertEqual(code, 0)
         self.assertIn(('close', 'w4:t1'), calls)
 
@@ -4189,6 +4195,16 @@ class TrustFolderTest(unittest.TestCase):
 
 
 class InitiativeTest(BusBase):
+    def test_back_to_active_clears_the_wait(self):
+        """An initiative that moves again must not keep a wait from a card that is long closed."""
+        bus.initiative_set(self.c, 'demo-wait', None, title='Demo', state='waiting', waits_on='Alex: card x')
+        bus.initiative_set(self.c, 'demo-wait', A, state='active', text='It moved again.')
+        row = self.c.execute("SELECT state, waits_on FROM initiatives WHERE slug='demo-wait'").fetchone()
+        self.assertEqual((row['state'], row['waits_on']), ('active', ''))
+        bus.initiative_set(self.c, 'demo-wait', A, text='No state change.', waits_on='the answer from Sam')
+        row = self.c.execute("SELECT waits_on FROM initiatives WHERE slug='demo-wait'").fetchone()
+        self.assertEqual(row['waits_on'], 'the answer from Sam')  # an explicit --waits is kept
+
     def test_set_refuses_an_empty_title(self):
         with self.c:
             pass
@@ -5252,7 +5268,10 @@ class StartQuestionDeliverTest(DeliverBase, QuestionHelpers):
         self.assertEqual(len(polar), 1)
 
     def test_a_delivery_with_its_resume_text_does_not_end_the_question(self):
-        self.queued_at_a_question(QuestionScreen(COLD_HEAD, COLD_330))
+        polar = []
+        with polar_stub(polar):  # without it, each run sent a real card to the owner
+            self.queued_at_a_question(QuestionScreen(COLD_HEAD, COLD_330))
+        self.assertEqual(len(polar), 1)
         with self.c:
             self.c.execute('UPDATE deliveries SET done_at=?, outcome=?', (bus.now(), f'delivered to {A[:8]} with its resume text (task:x)'))
         self.assertFalse(bus.passed_since(self.c, A, minutes_ago(10)))
