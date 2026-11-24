@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "fake session key in a test fixture"
+regexes = ['''a1b2c3d4e5f6''']

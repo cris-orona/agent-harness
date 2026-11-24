@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Tell each session what the owner chose in Polar. No model; run it every 15 s from launchd, systemd or cron.
+
+Reads decided Polar requests, then hands one line to `agent-bus deliver <session>` for the session in the
+request's `requester` field ("<claude session id> <herdr pane or tmux name>"). agent-bus types it into a server
+session, queues it for the laptop (a laptop session: the laptop's `agent-bus pull` types it), or meets the
+session's polar wait and resumes it (parked or closed). Polar types into its own live «task-<id>» tmux itself.
+Each run ends with `agent-bus pull` (queued deliveries of this machine) and, on server, `agent-bus wake`
+(parked server sessions with a met wait) until coord-tick takes these over (slice 3).
+The same script runs on the laptop (rollback): there `polar list` and tmux checks go over ssh.
+A sent `email` card gives its session the claim `thread mail:<gmail thread id>` (slice 9): coord-tick relays the
+next mail of that thread to it. `polar-notify --claim-mail [days]` does the same once for the cards of the last days.
+The owner's plain «ok» on a report, and a discarded or expired report, ask nothing of the session: the line goes with
+`--if-live` and no wait, so a parked or closed session is not resumed for it (`plain_ok`).
+Safety net (`rescue_revise`): a card still in `revise` whose session ended after the owner's «Pedir cambios» gets its
+instructions delivered once more (agent-bus resumes the session), so the change is not lost.
+State: ~/.local/state/polar-notify/state.json.
+"""
+import json, os, re, subprocess, sys
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("POLAR_NOTIFY_STATE") or os.path.join(HOME, ".local/state/polar-notify/state.json")
+POLAR = os.environ.get("POLAR_BIN") or "polar"
+BUS = os.environ.get("AGENT_BUS_BIN") or os.path.join(HOME, ".local/bin/agent-bus")
+TMUX = "/opt/homebrew/bin/tmux"
+DONE = {"sent", "chosen", "discarded", "expired", "failed", "answered", "skipped", "revise"}
+SKIP_PREFIX = ("agent-bus", "release-desk", "watchdog")
+SID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+MAX_TRIES = 20  # a card agent-bus keeps refusing (not «bus away») goes to the router after this many runs
+
+
+def is_server():
+    r = os.environ.get("AGENT_BUS_ROLE")
+    if r is None:
+        try:
+            with open(os.path.join(HOME, ".config/agent-bus/role")) as fh:
+                r = fh.read().strip()
+        except OSError:
+            r = ""
+    return r == "server"
+
+
+def runs_here():
+    """True unless this machine is a bus client (role `client`): then polar and tmux checks go over ssh."""
+    return not (os.environ.get("AGENT_BUS_ROLE") or _role_file()) == "client"
+
+
+def _role_file():
+    try:
+        with open(os.path.join(HOME, ".config/agent-bus/role")) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def on_server(cmd, timeout=30):
+    """Run a shell line on server (here when this is server). Return the CompletedProcess or None."""
+    argv = (["/bin/sh", "-c", cmd] if runs_here() else
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", os.environ.get("AGENT_BUS_SERVER_HOST", "server"), cmd])
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def load():
+    try:
+        return json.load(open(STATE))
+    except Exception:
+        return {"last": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+def save(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(st, fh)
+    os.replace(tmp, STATE)
+
+
+def questions_line(r):
+    """The owner's typed answers, verbatim, one numbered part per question."""
+    answers = r.get("answers") or {}
+    parts = []
+    for i, q in enumerate(r.get("questions") or [], 1):
+        short = " ".join(q["text"].split())
+        short = short if len(short) <= 60 else short[:59] + "…"
+        parts.append(f"{i}. {short} = {(answers.get(q['key']) or {}).get('text', '(sin respuesta)')}")
+    note = f"; nota: {r['note']}" if r.get("note") else ""
+    return (f"Polar (info): tus preguntas «{r['title']}» → {'; '.join(parts)}{note}. "
+            f"Run polar status {r['id']} for details.")
+
+
+def line(r):
+    if r.get("kind") == "questions" and r["status"] == "answered":
+        return questions_line(r)
+    if r["status"] == "revise" and r.get("via") == "next":
+        # He started one or more follow-ups that the report suggested (--next): new work, not a change of the card.
+        n = len(r.get("steps") or [])
+        if n > 1:
+            return (f"Polar (seguimiento): the owner started {n} of your suggested follow-ups on report {r['id']} "
+                    f"«{r['title']}»: {r.get('instructions') or ''}. Do all of them now. "
+                    f"Send one polar report when they are done.")
+        return (f"Polar (seguimiento): the owner started your suggested follow-up on report {r['id']} «{r['title']}»: "
+                f"{r.get('instructions') or ''}. Do it now. Send one polar report when it is done.")
+    if r["status"] == "revise":
+        return (f"Polar (cambios): the owner asks you to change your card {r['id']} «{r['title']}»: "
+                f"{r.get('instructions') or ''}. Write a new card with polar ask … --replaces {r['id']}.")
+    if r["status"] == "skipped":
+        return (f"Polar (info): your request {r['id']} «{r['title']}» was skipped — the owner answered newer cards first. "
+                f"If it still matters, re-ask with fresh context (no «URGENTE»), or drop it. Run polar status {r['id']} for details.")
+    what = {"sent": f"enviado {r.get('permalink') or ''}".strip(),
+            "chosen": f"elegiste «{r.get('chosen_option')}»",
+            "discarded": "descartado", "expired": "expiró sin respuesta",
+            "failed": f"falló: {r.get('error')}"}[r["status"]]
+    edited = " (editado por el dueño)" if r["status"] == "sent" and r.get("final_text") else ""
+    return f"Polar (info): your request {r['id']} «{r['title']}» → {what}{edited}. Run polar status {r['id']} for details."
+
+
+def real_requester(who):
+    """A prod-op card names «prod-op <op id> <session id> <pane or tmux>»: the session is the requester."""
+    parts = (who or "").split()
+    return " ".join(parts[2:]) if parts[:1] == ["prod-op"] else (who or "")
+
+
+def card_text(r):
+    raw = r.get("requester") or ""
+    text = line(r)
+    if raw.startswith("prod-op ") and r.get("status") == "chosen":
+        op = raw.split()[1]
+        text += f" (prod-op {op}: after a Go, run `prod-op run {op}` once, on server inside tmux)"
+    return text
+
+
+def bus(*args, stdin=None, timeout=300):
+    """Run agent-bus. Return (exit code, output). Never raises. A deliver may resume a session (about a minute)."""
+    try:
+        p = subprocess.run([sys.executable, BUS, *args], input=stdin, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except Exception as e:
+        return 3, f"{type(e).__name__}: {e}"
+
+
+def polars_own_task(sid, name):
+    """True when Polar types the answer itself: `name` is a live Polar task tmux («task-<task id>», not a resumed
+    «task-w<sid8>») and the bus does not have the session parked, closed or handed off (its tmux then ends soon,
+    and agent-bus must meet its wait instead)."""
+    if not (name.startswith("task-") and not name.startswith("task-w") and re.fullmatch(r"[\w.-]+", name)):
+        return False
+    p = on_server(f"{TMUX} has-session -t '={name}' 2>/dev/null && echo Y || echo N")
+    if not (p and p.returncode == 0 and p.stdout.strip() == "Y"):
+        return False
+    rc, out = bus("session", sid, timeout=60)
+    try:
+        row = json.loads(out.splitlines()[-1]) if rc == 0 and out else {}
+    except (ValueError, IndexError):
+        row = {}
+    return not (row.get("parked_at") or row.get("ended_at") or row.get("handoff_of"))
+
+
+def quiet_waiting(r):
+    """A «Te espera» card that ends with nothing to say: withdrawn or discarded, expired, skipped, or «Nada por
+    ahora» with no note. the task runner made the card, not the session, so the session expects no answer. Telling it
+    only makes it write a reply, and that reply brings the next «Te espera» card."""
+    if not (r.get("title") or "").startswith("Te espera: "):
+        return False
+    if r.get("status") in ("discarded", "expired", "skipped"):
+        return True
+    if r.get("status") == "answered":
+        a = (r.get("answers") or {}).get("respuesta") or {}
+        return a.get("option") == "nada" and not (r.get("note") or "").strip()
+    return False
+
+
+def plain_ok(r):
+    """The owner's «ok» on a report: he saw it, and nothing is asked of the session. A live session gets the line;
+    a parked or closed session is not resumed for it. (11-20 to 11-23: 10 of 83 such relays resumed a closed session
+    for nothing, and three of those resumes stopped at a start question and held the queue.) A report that the owner
+    discarded, or that expired with no answer, asks nothing either (11-20 to 11-23: 3 resumes of a closed session).
+    The «resume» option, a follow-up, «Pedir cambios» and every card that asks keep the wait.
+    A wait on a report card (a manual park adds one for each open card) is therefore not met by these outcomes;
+    park on a real wait, not on your own report."""
+    if r.get("kind") != "report":
+        return False
+    if r.get("status") in ("discarded", "expired"):
+        return True
+    return r.get("status") == "chosen" and r.get("chosen_option") == "ok"
+
+
+def handle(r):
+    """Hand one decided card to its session. Returns (done, log line). Not done: try again next run."""
+    raw = r.get("requester") or ""
+    who = real_requester(raw)
+    if who.startswith(SKIP_PREFIX):
+        return True, f"skip {r['id']} ({raw.split()[0]})"
+    if quiet_waiting(r):
+        return True, f"quiet {r['id']} ({r.get('status')}): a «Te espera» card with nothing to tell"
+    parts = who.split()
+    text = card_text(r)
+    if not parts or not SID.fullmatch(parts[0]):
+        # No session on the card (an old prod-op card, an empty requester): a session parked on polar:<id> takes it.
+        rc, out = bus("meet", "polar", r["id"], "--summary", text[:280])
+        if rc != 0:
+            return False, f"bus away, pending {r['id']}: {out[:160]}"
+        if out.startswith("met ") and out != "met 0":
+            return True, f"{out} by card {r['id']}"
+        note = (f"- {r.get('decided_at') or ''} Polar {r['id']} «{r['title']}» {r['status']} — requester {raw!r} "
+                f"names no session. {text}")
+        rc, out = bus("deliver", "router", "--text-file", "-", stdin=note)
+        return rc == 0, f"router {r['id']}: {out[:160]}"
+    if len(parts) > 1 and polars_own_task(parts[0], parts[1]):
+        return True, f"Polar types {r['id']} into {parts[1]}"
+    place = ["--place", parts[1]] if len(parts) > 1 else []
+    how = ["--if-live"] if plain_ok(r) else ["--wait", f"polar:{r['id']}"]
+    rc, out = bus("deliver", parts[0], "--ref", f"polar:{r['id']}:{r['status']}", *how,
+                  "--from", "polar-notify", *place, "--text-file", "-", stdin=text)
+    if rc == 0:
+        return True, f"{r['id']} {r['status']} -> {parts[0][:8]}: {out[:200]}"
+    return False, ("bus away, " if rc == 3 else "") + f"deliver failed ({rc}) for {r['id']}: {out[:200]}"
+
+
+def mail_claim(r):
+    """(claim key, session id) for an email card that Polar sent for a session, else None."""
+    if r.get("kind") != "email" or r.get("status") != "sent" or not r.get("thread_id"):
+        return None
+    parts = real_requester(r.get("requester") or "").split()
+    if not parts or not SID.fullmatch(parts[0]):
+        return None
+    return f"mail:{r['thread_id']}", parts[0]
+
+
+def claim_mail(r, again=False):
+    """The session that sent an email owns its thread. --no-touch: a closed session stays closed (the bus gives the
+    claim to its handoff successor). `again` (a claim the bus did not take the first time): --role follow, so it does
+    not take the thread back from a later sender. Returns (ok, log line); (True, None) when the card is no sent
+    email of a session."""
+    got = mail_claim(r)
+    if not got:
+        return True, None
+    rc, out = bus("claim", "thread", got[0], "--session", got[1], "--no-touch", *(["--role", "follow"] if again else []),
+                  timeout=60)
+    return rc == 0, f"claim thread {got[0]} -> {got[1][:8]}" + ("" if rc == 0 else f" failed ({rc}): {out[:120]}")
+
+
+def claim_mail_backfill(days=7):
+    """Claim the threads of the email cards sent in the last `days`, oldest first (the last sender ends primary)."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    n = 0
+    for r in sorted((r for r in polar_list(since) or [] if mail_claim(r)), key=lambda r: r.get("decided_at") or ""):
+        ok, note = claim_mail(r)
+        print(note)
+        n += ok
+    return n
+
+
+RESCUE_GRACE = 120  # s after the session ended: a handoff or a resume has time to finish first
+
+
+def iso_age(ts, now):
+    """Seconds from ISO time `ts` (…Z) to `now` (aware datetime); None when it does not parse."""
+    try:
+        return (now - datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def rescue_revise(reqs, st, now=None):
+    """Safety net for «Pedir cambios». A card in `revise` waits for its session to write a new card (--replaces). When
+    that session ended after the owner's answer (/exit, idle close, a crash, a handoff whose successor also ended)
+    and the card is still in `revise`, the owner's instructions are lost. Deliver them once more: agent-bus resumes
+    the closed session with them. Once for each card (state `rescued`); a parked or live session is left alone (its
+    polar wait or its screen has the text). Only cards the owner sent back after the first run (`rescue_since`).
+    A later card from the same session is its answer: a follow-up ends with a plain report (no --replaces), so the
+    old card stays in `revise`. Polar's open list has the same rule. A silent notice is no answer."""
+    now = now or datetime.now(timezone.utc)
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    since = st.setdefault("rescue_since", stamp)
+    done = st.setdefault("rescued", {})
+    ids = {r.get("id") for r in reqs}
+    for k in [k for k in done if k not in ids]:
+        done.pop(k)  # the card left the 3-day window
+    notes = []
+    last = {}  # session id -> time of its newest card
+    for n in reqs:
+        who = real_requester(n.get("requester") or "").split()
+        if who and not n.get("silent") and (n.get("created_at") or "") > last.get(who[0], ""):
+            last[who[0]] = n["created_at"]
+    for r in reqs:
+        if r.get("status") != "revise" or r.get("id") in done or (r.get("decided_at") or "") < since:
+            continue
+        parts = real_requester(r.get("requester") or "").split()
+        if not parts or not SID.fullmatch(parts[0]) or " ".join(parts).startswith(SKIP_PREFIX):
+            continue
+        if last.get(parts[0], "") > r["decided_at"]:
+            done[r["id"]] = stamp  # the session sent a card after the answer
+            continue
+        rc, out = bus("session", parts[0], timeout=60)
+        if rc != 0:
+            notes.append(f"rescue {r['id']}: bus away")
+            continue
+        try:
+            row = json.loads(out.splitlines()[-1]) if out else {}
+        except (ValueError, IndexError):
+            row = {}
+        if not row:
+            done[r["id"]] = stamp  # the bus does not know the session: handle() sent the card to the router
+            continue
+        ended = row.get("ended_at") or ""
+        if row.get("parked_at") or not ended or ended < r["decided_at"]:
+            continue  # live, parked, or it ended before the answer (the first delivery resumes it)
+        age = iso_age(ended, now)
+        if age is None or age < RESCUE_GRACE:
+            continue
+        text = (f"Polar (cambios, otra vez): your session ended before it answered «Pedir cambios» on card {r['id']}. "
+                + line(r))
+        place = ["--place", parts[1]] if len(parts) > 1 else []
+        rc, out = bus("deliver", parts[0], "--ref", f"polar:{r['id']}:revise-rescue", "--wait", f"polar:{r['id']}",
+                      "--from", "polar-notify", *place, "--text-file", "-", stdin=text)
+        if rc == 0:
+            done[r["id"]] = stamp
+            notes.append(f"rescue {r['id']} -> {parts[0][:8]}: {out[:200]}")
+        else:
+            notes.append(f"rescue {r['id']} failed ({rc}): {out[:200]}")
+    return notes
+
+
+def polar_list(since):
+    p = on_server(f"{POLAR} list --status all --since {since}")
+    if not p or p.returncode != 0:
+        print("polar list failed:", (p.stderr.strip()[:200] if p else "no answer"), file=sys.stderr)
+        return None
+    out = []
+    for l in p.stdout.splitlines():
+        try:
+            out.append(json.loads(l))
+        except ValueError:
+            pass
+    return out
+
+
+def main():
+    if sys.argv[1:2] in (["-h"], ["--help"]):
+        print(__doc__)
+        return
+    st = load()
+    if not os.path.exists(STATE):
+        save(st)  # fix the starting point, so no answer falls between two runs
+    since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reqs = polar_list(since)
+    if reqs is not None:
+        pending = st.setdefault("pending", {})
+        for k, v in list(pending.items()):
+            if not isinstance(v, dict):
+                pending[k] = {"at": v, "tries": 0}  # the state of the older polar-notify
+        new = sorted((r for r in reqs if r.get("status") in DONE and (r.get("decided_at") or "") > st["last"]),
+                     key=lambda r: r["decided_at"])
+        by_id = {r["id"]: r for r in reqs}
+        for i in list(pending):
+            if i not in by_id:
+                pending.pop(i)  # the card left the 3-day window
+        new_ids = {r["id"] for r in new}
+        claims = st.setdefault("mail_claims", {})  # thread claims the bus did not take (bus away): card id -> tries
+        for i in list(claims):
+            if i not in by_id or not mail_claim(by_id[i]):
+                claims.pop(i)  # the card left the 3-day window
+                continue
+            ok, note = claim_mail(by_id[i], again=True)
+            print(note)
+            if ok:
+                claims.pop(i)
+            else:
+                claims[i] += 1
+        for i in list(pending):
+            if i not in new_ids and by_id[i].get("status") not in DONE:
+                pending.pop(i)  # replaced or reopened since: nothing to tell
+        retry = [by_id[i] for i in pending if i not in new_ids]
+        for r in retry + new:
+            try:
+                done, msg = handle(r)
+            except Exception as e:  # one odd card must not stop the others
+                done, msg = False, f"error on {r.get('id')}: {type(e).__name__}: {e}"
+            print(msg)
+            if r["id"] in new_ids:  # the first look at the card: its session becomes the primary owner of the thread
+                try:
+                    ok, note = claim_mail(r)
+                except Exception as e:
+                    ok, note = False, f"claim error on {r.get('id')}: {type(e).__name__}: {e}"
+                if note:
+                    print(note)
+                if not ok:
+                    st.setdefault("mail_claims", {})[r["id"]] = 1  # the bus did not take it: tried again each run
+            if not done:
+                p = pending.setdefault(r["id"], {"at": r.get("decided_at"), "tries": 0})
+                p["tries"] += 1
+                if p["tries"] >= MAX_TRIES and not msg.startswith("bus away"):
+                    note = f"- {r.get('decided_at')} Polar {r['id']} «{r['title']}» {r['status']} — not delivered: {msg}"
+                    rc, _ = bus("deliver", "router", "--text-file", "-", stdin=note)
+                    if rc == 0:
+                        pending.pop(r["id"], None)
+            else:
+                pending.pop(r["id"], None)
+            if r["id"] in new_ids:
+                st["last"] = max(st["last"], r["decided_at"])
+            save(st)
+        save(st)  # also when only a stale pending card left
+        try:
+            for note in rescue_revise(reqs, st):
+                print(note)
+        except Exception as e:  # the safety net must never stop the run
+            print(f"rescue error: {type(e).__name__}: {e}")
+        save(st)
+    rc, out = bus("pull", "--max", "5", "--budget", "40")
+    if out and out != "nothing to deliver":
+        print("pull:", out.replace("\n", "; ")[:600])
+    if is_server():
+        rc, out = bus("wake", "--max", "2")
+        if out and out != "nothing to wake":
+            print("wake:", out.replace("\n", "; ")[:600])
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--claim-mail"]:
+        print(f"claimed {claim_mail_backfill(int(sys.argv[2]) if len(sys.argv) > 2 else 7)}")
+    else:
+        main()

@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""herdr-deliver: type a message into a Claude Code pane and make sure it is submitted.
+
+Usage: herdr-deliver [--stash] [--tmux NAME] <pane> <text | ->      (use «-» to read the text from stdin)
+       herdr-deliver [--stash] --tmux NAME <text | ->               (server tmux session; no pane)
+
+--stash: text left in the box (a draft the owner left, or a stray key) does not block. When the box text stays the
+same for STILL_WAIT seconds and is one line of at most STASH_MAX characters, clear it (Ctrl+E, Ctrl+U), deliver,
+then type the draft back (no Enter). The caller passes it only after the message waited some minutes.
+
+Exit 0: delivered (the input box is empty again, or only shows the dim suggestion).
+Exit 3: the owner is typing in the box (or, with --stash, the draft changed, is too long, or did not clear).
+        Nothing was typed and the draft is as it was. Retry later.
+Exit 4: the text is still in the box after 3 Enter tries. It is left there (not cleared).
+Exit 5: no Claude Code input box on screen (a plain shell, a dead pane, or a menu). Nothing was typed.
+Exit 2: usage error.
+
+Steps: check the owner is not typing; send the text; wait until the box shows it (or «[Pasted text»);
+send Enter; poll until the box is empty; send Enter again if the text stays (max 3 tries).
+Claude Code takes a message typed while it works into a queue and empties the box, so «box empty» is success.
+"""
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+HERDR = os.path.join(HOME, ".local/bin/herdr")
+SERVER_HOST = os.environ.get("AGENT_BUS_SERVER_HOST", "server")
+SERVER_TMUX = os.environ.get("AGENT_BUS_SERVER_TMUX", "tmux")
+SHOW_WAIT = 5.0      # seconds to wait until the box shows the text
+CLEAR_WAIT = 6.0     # seconds to wait after the first Enter
+RETRY_WAIT = 2.0     # seconds between later Enter tries
+STILL_WAIT = 4.0     # --stash: the draft must stay the same this long (the owner is not typing now)
+STASH_MAX = 300      # --stash: longer drafts (or multi-line ones) are never moved
+TRIES = 3
+POLL = 0.5
+
+
+def sh(cmd, timeout=40):
+    """Run a command. Return (exit code, stdout). Tests replace this."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except Exception:
+        return 1, ""
+
+
+def is_bus_server():
+    """True on server: the tmux sessions are on this machine, so no ssh. Env AGENT_BUS_ROLE wins, else the role file."""
+    r = os.environ.get("AGENT_BUS_ROLE")
+    if r is None:
+        try:
+            with open(os.path.join(HOME, ".config/agent-bus/role")) as fh:
+                r = fh.read().strip()
+        except OSError:
+            r = ""
+    return r == "server"
+
+
+class Target:
+    """One pane (Herdr) or one tmux session on server."""
+
+    def __init__(self, pane=None, tmux=None):
+        self.pane, self.tmux = pane, tmux
+
+    def _ssh(self, cmd):
+        if is_bus_server():
+            return sh(["/bin/sh", "-c", cmd])
+        return sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", SERVER_HOST, cmd])
+
+    def _tmux_cmd(self, *args):
+        return f"{SERVER_TMUX} " + " ".join(args)
+
+    def _tgt(self):
+        # zsh expands a word that starts with «=»: always single-quote, even when shlex would not.
+        return "'" + f"={self.tmux}:".replace("'", "'\\''") + "'"
+
+    def type_text(self, text):
+        if self.tmux:
+            return self._ssh(self._tmux_cmd("send-keys", "-t", self._tgt(), "-l", "--", shlex.quote(text)))[0]
+        return sh([HERDR, "pane", "send-text", self.pane, text])[0]
+
+    def keys(self, *names):
+        if self.tmux:
+            return self._ssh(self._tmux_cmd("send-keys", "-t", self._tgt(), *names))[0]
+        return sh([HERDR, "pane", "send-keys", self.pane, *names])[0]
+
+    def enter(self):
+        if self.tmux:
+            return self._ssh(self._tmux_cmd("send-keys", "-t", self._tgt(), "Enter"))[0]
+        return sh([HERDR, "pane", "send-keys", self.pane, "Enter"])[0]
+
+    def read(self):
+        if self.tmux:
+            return self._ssh(self._tmux_cmd("capture-pane", "-p", "-e", "-t", self._tgt()))[1]
+        return sh([HERDR, "pane", "read", self.pane, "--source", "recent-unwrapped", "--lines", "40", "--ansi"])[1]
+
+
+def box_text(raw):
+    """Text in the Claude Code input box, "" when it is empty, None when no box is found.
+
+    The box is the «❯ …» line(s) between two «────» rules at the bottom. Claude Code draws its suggested next
+    prompt dim (ESC[2m): drop dim runs, then strip the other escape codes. The «Try "…"» placeholder is empty."""
+    out = [re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", re.sub(r"\x1b\[2m.*?(\x1b\[(0|22)m|$)", "", l))
+           for l in raw.splitlines()]
+    rules = [i for i, l in enumerate(out) if l.strip().startswith("────")]
+    for a, b in zip(rules[::-1][1:], rules[::-1]):  # rule pairs from the bottom up
+        box = [l.strip() for l in out[a + 1:b] if l.strip()]
+        if box and box[0].startswith("❯"):
+            text = " ".join([box[0][1:].strip()] + box[1:]).strip()
+            return "" if text.startswith('Try "') else text
+    return None
+
+
+def owner_typing(target):
+    return bool(box_text(target.read()))
+
+
+def _squash(s):
+    return re.sub(r"\s+", "", s)
+
+
+def shows_text(box, text):
+    if box is None:
+        return False
+    return "[Pasted text" in box or (bool(_squash(text)) and _squash(box).startswith(_squash(text)[:20]))
+
+
+def wait_for(target, pred, seconds):
+    end = time.monotonic() + seconds
+    while True:
+        box = box_text(target.read())
+        if pred(box):
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(POLL)
+
+
+def draft_lines(raw):
+    """Number of text lines in the box (a multi-line draft is never moved: the box joins its lines)."""
+    out = [re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", l) for l in raw.splitlines()]
+    rules = [i for i, l in enumerate(out) if l.strip().startswith("────")]
+    for a, b in zip(rules[::-1][1:], rules[::-1]):
+        box = [l for l in out[a + 1:b] if l.strip()]
+        if box and box[0].strip().startswith("❯"):
+            return len(box)
+    return 0
+
+
+def stash_draft(target, box, sleep=time.sleep):
+    """Clear a still, one-line draft. Return True when the box is empty now; False leaves the draft as it was."""
+    if len(box) > STASH_MAX:
+        return False
+    sleep(STILL_WAIT)
+    raw = target.read()
+    if box_text(raw) != box or draft_lines(raw) != 1:
+        return False  # the owner types now, or the draft has more lines
+    target.keys("C-e")
+    target.keys("C-u")
+    if wait_for(target, lambda b: b == "", SHOW_WAIT):
+        return True
+    now_box = box_text(target.read()) or ""
+    if now_box != box:  # half cleared: put the draft back as it was
+        target.keys("C-e")
+        target.keys("C-u")
+        if wait_for(target, lambda b: b == "", SHOW_WAIT):
+            target.type_text(box)
+    return False
+
+
+def deliver(target, text, stash=False, sleep=time.sleep):
+    """Return the exit code described in the module docstring."""
+    text = text.rstrip("\n")
+    box = box_text(target.read())
+    if box is None:
+        return 5  # a shell would run the text as a command: never type without a Claude Code box
+    draft = ""
+    if box:
+        if not stash or not stash_draft(target, box, sleep=sleep):
+            return 3
+        draft = box
+    rc = _send(target, text)
+    if draft and rc == 0 and wait_for(target, lambda b: b == "", SHOW_WAIT):
+        target.type_text(draft)  # back as it was, not submitted
+    return rc
+
+
+def _send(target, text):
+    target.type_text(text)
+    wait_for(target, lambda b: shows_text(b, text), SHOW_WAIT)  # go on even if unseen: Enter is the safe next step
+    for attempt in range(TRIES):
+        target.enter()
+        # An unreadable box (None) cannot be checked: treat it as delivered.
+        if wait_for(target, lambda b: not b, CLEAR_WAIT if attempt == 0 else RETRY_WAIT):
+            return 0
+    return 4
+
+
+def main(argv):
+    args = list(argv)
+    stash = args[:1] == ["--stash"]
+    if stash:
+        args = args[1:]
+    tmux = None
+    if args[:1] == ["--tmux"] and len(args) >= 2:
+        tmux, args = args[1], args[2:]
+    if (tmux and len(args) != 1) or (not tmux and len(args) != 2):
+        print(__doc__.split("\n\n")[0], file=sys.stderr)
+        return 2
+    text = sys.stdin.read() if args[-1] == "-" else args[-1]
+    target = Target(pane=None if tmux else args[0], tmux=tmux)
+    return deliver(target, text, stash=stash)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
