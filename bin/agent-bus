@@ -70,6 +70,38 @@ Roles (~/.config/agent-bus/role, or env AGENT_BUS_ROLE):
 import json, os, random, re, shlex, shutil, sqlite3, subprocess, sys, time, uuid
 from datetime import datetime, timezone, timedelta
 
+
+def _load_settings_file():
+    """Fill unset env values from a settings file, so launchd jobs, hooks and cron get the same settings as a shell.
+
+    File: AGENT_HARNESS_ENV_FILE, default ~/.config/agent-harness/env. Plain KEY=VALUE lines (`export` and one pair
+    of outer quotes are allowed; # starts a comment line). A value that is already set in the env wins. A leading
+    `~/`, and `~/` after a space, become the home folder. AGENT_HARNESS_ENV_FILE="" turns the file off.
+    The same block is in each tool of bin/ (each tool is one file); keep the copies the same."""
+    path = os.environ.get("AGENT_HARNESS_ENV_FILE", os.path.expanduser("~/.config/agent-harness/env"))
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines() if path else []
+    except OSError:
+        return
+    home = os.path.expanduser("~")
+    for line in lines:
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = (x.strip() for x in line.split("=", 1))
+        if not key.isidentifier() or key in os.environ:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+            val = val[1:-1]
+        if val.startswith("~/"):
+            val = home + val[1:]
+        os.environ[key] = val.replace(" ~/", " " + home + "/")
+
+
+_load_settings_file()
+
 KINDS = ("pr", "thread", "topic", "branch", "initiative")
 LIVE_DAYS = 3
 ENDED_DAYS = 1

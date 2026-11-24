@@ -139,6 +139,18 @@ chat goes in through a router and out through the approval app.
 
 ## Configuration
 
+Every tool reads its settings from the environment. To set them once for every caller (a shell, a launchd job, a
+Claude Code hook, cron), put plain `KEY=VALUE` lines in `~/.config/agent-harness/env`. A tool fills each value that
+is not already set in its environment; `~/` at the start of a value, or after a space, becomes your home folder.
+`AGENT_HARNESS_ENV_FILE` picks another file, and `AGENT_HARNESS_ENV_FILE=""` turns the file off.
+
+```sh
+# ~/.config/agent-harness/env
+AGENT_BUS_SERVER_HOST=my-server
+AGENT_BUS_OWNER_NAMES='ada,u012345'
+POLAR_BIN=~/polar/bin/polar
+```
+
 | Variable | Meaning | Default |
 |---|---|---|
 | `AGENT_BUS_ROLE` | `local`, `server` or `client` | `local` |

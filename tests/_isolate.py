@@ -2,6 +2,7 @@
 import os, tempfile
 from pathlib import Path
 
+os.environ['AGENT_HARNESS_ENV_FILE'] = ''  # never the real settings file
 os.environ['AGENT_BUS_ROLE'] = 'local'
 os.environ['AGENT_BUS_BIN'] = str(Path(__file__).resolve().parents[1] / "bin/agent-bus")
 DEFAULT_DB = os.path.join(tempfile.mkdtemp(prefix='bus-test-'), 'bus.db')
