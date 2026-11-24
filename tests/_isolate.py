@@ -12,3 +12,6 @@ os.environ.setdefault('HERDR_DELIVER_BIN', '/usr/bin/false')  # a test that type
 os.environ.setdefault('AGENT_BUS_WAKE_SETTLE', '0')  # tests park and wake at once
 os.environ.setdefault('AGENT_BUS_ROUTER_HOST', 'local')  # never the real router-host switch file
 os.environ.setdefault('AGENT_BUS_RESUME_BUDGET', '0')  # no resume budget unless a test sets one
+# Never a live premium-model check: AGENT_BUS_MODEL_FULL_CMD unset means "not full", so the model a test expects
+# does not change when the real weekly limit is used up. A test that needs "full" sets it itself.
+os.environ.pop('AGENT_BUS_MODEL_FULL_CMD', None)

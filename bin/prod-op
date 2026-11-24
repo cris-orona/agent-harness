@@ -11,7 +11,18 @@ the hash still matches, and that the op did not run before. Each run is logged i
 ~/.local/state/prod-op/ledger.jsonl. Add your own kinds (a feature flag, a dashboard publish) by adding a
 build_<kind> and apply_<kind> function and registering them in BUILD and APPLY.
 
-Environment: POLAR_BIN (approval app CLI, default `polar`), PROD_OP_SCRIPT_ROOT (default ~/.local/share/agent-tasks).
+Environment: POLAR_BIN (approval app CLI, default `polar`), PROD_OP_SCRIPT_ROOT (default ~/.local/share/agent-tasks),
+PROD_OP_PLUGINS (a folder of *.py plugins, see below), PROD_OP_SECRET_EXTRA (one more regex to hide in output),
+PROD_OP_TMUX (tmux path if it is not on PATH), AGENT_BUS_LANG (en or es: the owner-facing card text).
+
+Plugins: PROD_OP_PLUGINS=<dir>. prod-op imports each <dir>/*.py in name order and calls its `register(op)`.
+`op` is this module. A plugin adds one kind with
+  op.register_kind(name, build, apply, add_args=None)
+  build(args, op_dir)             -> (spec, summary, dry_text, detail); spec is a dict with 'kind': name;
+                                     raise op.Refuse('text') to refuse the request
+  apply(spec, op_dir, polar_id)   -> (exit_code, output_text); runs only after the owner's Go
+  add_args(parser)                -> add the kind's own options to its `request <name>` parser
+`--why`, `--requester` and `--requester-label` exist for every kind.
 """
 import argparse
 import hashlib
@@ -29,13 +40,30 @@ HOME = Path.home()
 STATE = HOME / '.local/state/prod-op'
 OPS = STATE / 'ops'
 LEDGER = STATE / 'ledger.jsonl'
-POLAR = Path(os.environ.get('POLAR_BIN') or 'polar')
-SCRIPT_ROOT = Path(os.environ.get('PROD_OP_SCRIPT_ROOT') or HOME / '.local/share/agent-tasks')
+POLAR = Path(os.environ.get('POLAR_BIN') or 'polar').expanduser()
+SCRIPT_ROOT = Path(os.environ.get('PROD_OP_SCRIPT_ROOT') or HOME / '.local/share/agent-tasks').expanduser()
 SCRIPT_MAX_BYTES = 2_000_000
 TAIL = 40
 GO_HOURS = 12            # a Go older than this does not run
 # add your own token patterns here; matches are hidden from every printed or stored output
-SECRET_RE = re.compile(r'(gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]+)')
+_SECRET = r'(gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]+)'
+if os.environ.get('PROD_OP_SECRET_EXTRA'):
+    _SECRET = _SECRET[:-1] + '|' + os.environ['PROD_OP_SECRET_EXTRA'] + ')'
+SECRET_RE = re.compile(_SECRET)
+
+LANG = 'es' if (os.environ.get('AGENT_BUS_LANG') or 'en').lower().startswith('es') else 'en'
+TEXTS = {
+    'en': {'title': 'Production: ', 'exact': 'Exact change: ', 'go': 'Run in production', 'no': 'Do not run',
+           'why_err': '--why: one plain line for the owner',
+           'script_detail': 'Script {name}, files: {names}. Read it first: prod-op show ID'},
+    'es': {'title': 'Producción: ', 'exact': 'Cambio exacto: ', 'go': 'Correr en producción', 'no': 'No correr',
+           'why_err': '--why: one plain line in Spanish for the owner',
+           'script_detail': 'Script {name}, archivos: {names}. Ver antes: prod-op show ID'},
+}
+
+
+def txt(key, **kw):
+    return TEXTS[LANG][key].format(**kw) if kw else TEXTS[LANG][key]
 
 OUTSIDE_RE = re.compile(r'agent-tasks/|(^|[;&|\s])(source|\.)\s+[~/$]', re.M)
 NAME_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]{0,99}$')
@@ -71,7 +99,7 @@ def own_requester():
         pid = int(out)
     tm = ""
     if sid and os.environ.get("TMUX"):
-        tmux = shutil.which("tmux") or "tmux"
+        tmux = shutil.which("tmux") or os.environ.get("PROD_OP_TMUX") or "tmux"
         tm = subprocess.run([tmux, "display-message", "-p", "#S"], capture_output=True, text=True).stdout.strip()
     return f"{sid} {tm}".strip()
 
@@ -125,7 +153,7 @@ def build_script(a, op_dir):
                          'put every file the script needs in its own folder')
     spec = {'kind': 'script', 'name': a.name, 'files': files}
     names = ', '.join(sorted(files))
-    detail = f'Script {a.name}, files: {names}. Read it first: prod-op show ID'
+    detail = txt('script_detail', name=a.name, names=names)
     note = ('prod-op does not run the script before the Go. Run `bash run.sh dry` yourself first and put '
             'its result in --why.\nFiles: ' + names + '\n')
     return spec, f'script {a.name}', note, detail
@@ -141,6 +169,27 @@ def apply_script(spec, op_dir, polar_id):
 
 BUILD = {'script': build_script}
 APPLY = {'script': apply_script}
+ARGS = {'script': lambda k: k.add_argument('--name', required=True)}
+
+
+def register_kind(name, build, apply, add_args=None):
+    """Plugin API: add a request kind. See the module doc."""
+    if name in BUILD:
+        raise ValueError(f'prod-op kind already registered: {name}')
+    BUILD[name], APPLY[name] = build, apply
+    ARGS[name] = add_args or (lambda k: None)
+
+
+def load_plugins():
+    import importlib.util
+    d = os.environ.get('PROD_OP_PLUGINS')
+    if not d:
+        return
+    for f in sorted(Path(d).expanduser().glob('*.py')):
+        spec = importlib.util.spec_from_file_location('prod_op_plugin_' + f.stem, f)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.register(sys.modules[__name__])
 
 
 # ---------- state + Polar ----------
@@ -177,7 +226,7 @@ def polar(args):
 def cmd_request(a):
     why = ' '.join((a.why or '').split())
     if not why:
-        raise Refuse('--why: one plain line for the owner')
+        raise Refuse(txt('why_err'))
     op_id = uuid.uuid4().hex[:12]
     d = OPS / op_id
     d.mkdir(parents=True, exist_ok=False)
@@ -186,9 +235,9 @@ def cmd_request(a):
         spec, summary, dry, detail = BUILD[a.kind](a, d)
         h = spec_hash(spec)
         (d / 'dry.out').write_text(redact(dry))
-        title = f'Production: {summary} · {h[:10]}'
+        title = f'{txt("title")}{summary} · {h[:10]}'
         detail = detail.replace('prod-op show ID', f'prod-op show {op_id}')
-        line2 = 'Exact change: ' + detail
+        line2 = txt('exact') + detail
         room = 280 - len(line2) - 1
         if room < 40:
             line2, room = line2[:200] + '…', 79
@@ -197,7 +246,7 @@ def cmd_request(a):
                       '--expires-hours', str(GO_HOURS),
                       '--requester', f'prod-op {op_id} {a.requester or own_requester()}'.strip(),
                       '--requester-label', a.requester_label or f'prod-op {a.kind}',
-                      '--option', 'go:Run in production', '--option', 'no:Do not run'])
+                      '--option', 'go:' + txt('go'), '--option', 'no:' + txt('no')])
     except BaseException:
         shutil.rmtree(d, ignore_errors=True)
         raise
@@ -282,17 +331,18 @@ def cmd_list(a):
 
 
 def main(argv=None):
+    load_plugins()
     p = argparse.ArgumentParser(prog='prod-op', description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
     r = sub.add_parser('request')
     rk = r.add_subparsers(dest='kind', required=True)
-    for kind in ('script',):
+    for kind in sorted(BUILD):
         k = rk.add_parser(kind)
         k.add_argument('--why', required=True)
         k.add_argument('--requester')
         k.add_argument('--requester-label')
-        k.add_argument('--name', required=True)
+        ARGS[kind](k)
     for name in ('run', 'show'):
         s = sub.add_parser(name)
         s.add_argument('id')

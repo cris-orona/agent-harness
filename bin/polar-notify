@@ -25,7 +25,10 @@ POLAR = os.environ.get("POLAR_BIN") or "polar"
 BUS = os.environ.get("AGENT_BUS_BIN") or os.path.join(HOME, ".local/bin/agent-bus")
 TMUX = "/opt/homebrew/bin/tmux"
 DONE = {"sent", "chosen", "discarded", "expired", "failed", "answered", "skipped", "revise"}
-SKIP_PREFIX = ("agent-bus", "release-desk", "watchdog")
+# Sessions that are no owner sessions: their cards get no answer line. POLAR_NOTIFY_SKIP_EXTRA adds more prefixes
+# (comma list, for example "disk-cleanup,my-bot").
+SKIP_PREFIX = ("agent-bus", "release-desk", "watchdog") + tuple(
+    x.strip() for x in (os.environ.get("POLAR_NOTIFY_SKIP_EXTRA") or "").split(",") if x.strip())
 SID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MAX_TRIES = 20  # a card agent-bus keeps refusing (not «bus away») goes to the router after this many runs
 

@@ -22,6 +22,31 @@ QUESTIONS = {
 }
 
 
+class SkipExtraTest(unittest.TestCase):
+    def load(self, extra):
+        old = os.environ.get('POLAR_NOTIFY_SKIP_EXTRA')
+        os.environ['POLAR_NOTIFY_SKIP_EXTRA'] = extra
+        try:
+            ld = importlib.machinery.SourceFileLoader('polar_notify_extra', str(PATH))
+            m = importlib.util.module_from_spec(importlib.util.spec_from_loader('polar_notify_extra', ld))
+            ld.exec_module(m)
+            return m
+        finally:
+            if old is None:
+                os.environ.pop('POLAR_NOTIFY_SKIP_EXTRA')
+            else:
+                os.environ['POLAR_NOTIFY_SKIP_EXTRA'] = old
+
+    def test_env_adds_skip_prefixes(self):
+        m = self.load('disk-cleanup, my bot (setup) ,')
+        self.assertEqual(m.SKIP_PREFIX[-2:], ('disk-cleanup', 'my bot (setup)'))
+        self.assertTrue('disk-cleanup x'.startswith(m.SKIP_PREFIX))
+        self.assertIn('agent-bus', m.SKIP_PREFIX)
+
+    def test_no_env_keeps_the_defaults(self):
+        self.assertEqual(self.load('').SKIP_PREFIX, ('agent-bus', 'release-desk', 'watchdog'))
+
+
 class PolarNotifyTest(unittest.TestCase):
     def test_answered_is_done(self):
         self.assertIn('answered', notify.DONE)

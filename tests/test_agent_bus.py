@@ -568,7 +568,7 @@ class ParkTest(BusBase):
         self.assertEqual([c for c in calls if c[0] == 'notification'], [])
         self.assertEqual(len(polar_calls), 1)
         card = polar_calls[0]
-        self.assertEqual(card[:3], ['polar', 'ask', 'decision'])
+        self.assertEqual([os.path.basename(card[0])] + card[1:3], ['polar', 'ask', 'decision'])
         self.assertTrue(card[card.index('--title') + 1].startswith('Confirma la carpeta en la pestaña '))
         self.assertIn('ok:Listo', card)
         self.assertIn('Yes, I trust this folder', card[card.index('--context') + 1])
@@ -778,6 +778,31 @@ class ParkTest(BusBase):
         self.cli('unpark', A)
         self.assertEqual(bus.open_waits(self.c), [])
         self.assertIsNone(self.c.execute('SELECT parked_at FROM sessions WHERE session_id=?', (A,)).fetchone()[0])
+
+
+class TextTableTest(unittest.TestCase):
+    """AGENT_BUS_LANG picks the few fixed owner-facing texts; the server name comes from AGENT_BUS_SERVER_HOST."""
+    def setUp(self):
+        self.addCleanup(setattr, bus, 'LANG', bus.LANG)
+
+    def test_default_is_english(self):
+        bus.LANG = 'en'
+        self.assertIn('Where: its', bus.attach_line('task-w1'))
+        self.assertIn('tmux attach -t task-w1', bus.attach_line('task-w1'))
+
+    def test_spanish_text_and_server_name(self):
+        bus.LANG = 'es'
+        self.assertIn('Dónde: su pestaña', bus.attach_line('task-w1'))
+        self.assertIn(bus.SERVER_HOST, bus.attach_line('task-w1'))
+        self.assertIn(bus.SERVER_LABEL, bus.txt('took_over_title'))
+        self.assertEqual(bus.txt('tz_note'), 'hora de Ciudad de México')
+
+    def test_unknown_language_is_english(self):
+        bus.LANG = 'fr'
+        self.assertEqual(bus.txt('two_copies_title'), 'Two copies of one session: ')
+
+    def test_every_language_has_every_key(self):
+        self.assertEqual(set(bus.TEXTS['en']), set(bus.TEXTS['es']))
 
 
 if __name__ == '__main__':
@@ -1478,6 +1503,264 @@ class DeliverSlackWaitTest(DeliverBase):
         self.mail_wait(message_id='m78')
         out = bus.deliver(self.c, A, 'hi', ref='mail:m77')
         self.assertTrue(out.startswith('delivered'), out)
+
+
+MODEL_LIMIT_MENU = """  Continue the task.
+  You've reached your Fable limit
+  You've used your included Fable usage for this week. Continuing on Fable 5.2 uses usage credits, purchased separately from your plan.
+  Learn more: https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans
+  ❯ Switch to Opus 5.5 and continue
+    Continue with Fable 5.2
+  Enter to confirm · Esc to cancel
+"""
+
+
+MODEL_LIMIT_FABLE_CURSOR = MODEL_LIMIT_MENU.replace('  ❯ Switch to Opus 5.5 and continue\n    Continue with Fable 5.2',
+                                                   '    Switch to Opus 5.5 and continue\n  ❯ Continue with Fable 5.2')
+
+
+
+
+class ModelLimitMenuTest(DeliverBase):
+    """«You've reached your Fable limit»: the cursor on «Switch to Opus … and continue» gets Enter (owner, 2026-11-24).
+    Any other cursor row gets no key and one card."""
+    PATCHED = DeliverBase.PATCHED + ('place_screen', 'polar_wake_card')
+
+    def setUp(self):
+        super().setUp()
+        self.cards = []
+        bus.polar_wake_card = lambda title, ctx, plain, body=None: self.cards.append((title, body)) or True
+
+    def test_reader(self):
+        self.assertTrue(bus.model_limit_menu(MODEL_LIMIT_MENU))
+        self.assertFalse(bus.model_limit_menu(MODEL_LIMIT_MENU + LIMIT_MENU_GONE))  # quoted above a live box
+        self.assertFalse(bus.model_limit_menu(MODEL_LIMIT_MENU.replace('Enter to confirm · Esc to cancel', '')))
+        self.assertFalse(bus.model_limit_menu(LIMIT_MENU))
+        self.assertFalse(bus.limit_menu(MODEL_LIMIT_MENU))
+        self.assertFalse(bus.model_limit_menu(None))
+        self.assertEqual(bus.model_limit_cursor(MODEL_LIMIT_MENU), 'Switch to Opus 5.5 and continue')
+        self.assertEqual(bus.model_limit_cursor(MODEL_LIMIT_FABLE_CURSOR), 'Continue with Fable 5.2')
+        self.assertIsNone(bus.model_limit_cursor(MODEL_LIMIT_MENU + LIMIT_MENU_GONE))
+
+    def test_the_stop_menu_with_the_credits_row_of_an_org_is_still_closed_with_escape(self):
+        org = LIMIT_MENU.replace('3. Switch to usage credits', '3. Your organization is out of usage credits · ask an admin')
+        self.assertTrue(bus.limit_menu(org))
+        self.set_session(host='server', tmux='task-wx')
+        bus.place_screen = lambda host, place: org
+        self.rc_tmux = 5
+        self.assertIn('Escape closed it', bus.deliver(self.c, A, 'continue'))
+
+    def test_a_server_delivery_presses_enter_on_switch_to_opus(self):
+        self.set_session(host='server', tmux='task-wx', title='Caso Ejemplo')
+        bus.place_screen = lambda host, place: MODEL_LIMIT_MENU
+        self.rc_tmux = 5
+        out = bus.deliver(self.c, A, 'continue')
+        self.assertIn('Enter chose «Switch to Opus»', out)
+        sent = [c for c in self.ssh_calls if 'send-keys' in c]
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].endswith(' Enter') and 'task-wx' in sent[0], sent[0])
+        self.assertEqual(self.cards, [])
+
+    def test_the_cursor_on_continue_with_fable_gets_no_key_and_one_card(self):
+        self.set_session(host='server', tmux='task-wx', title='Caso Ejemplo')
+        bus.place_screen = lambda host, place: MODEL_LIMIT_FABLE_CURSOR
+        self.rc_tmux = 5
+        out = bus.deliver(self.c, A, 'continue')
+        self.assertIn('no key; the owner has a Polar card', out)
+        bus.pull(self.c)
+        self.assertEqual([c for c in self.ssh_calls if 'send-keys' in c], [])
+        self.assertEqual(len(self.cards), 1)
+        self.assertIn('tmux attach -t task-wx', self.cards[0][1])
+        self.assertTrue(bus.wake_held(self.c, A))
+
+    def test_sweep_switches_a_session_with_no_message_waiting(self):
+        bus.place_screen = lambda host, place: MODEL_LIMIT_MENU if place == 'task-wabc12345' else MODEL_LIMIT_FABLE_CURSOR
+        def ssh(cmd, timeout=40):
+            self.ssh_calls.append(cmd)
+            return (0, 'task-wabc12345\nother\n') if 'list-sessions' in cmd else (0, '')
+        bus.ssh = ssh
+        self.assertEqual(bus.model_limit_sweep(self.c), ['task-wabc12345'])
+        sent = [c for c in self.ssh_calls if 'send-keys' in c]
+        self.assertEqual(len(sent), 1)
+        self.assertIn('task-wabc12345', sent[0])
+        self.assertEqual(self.c.execute("SELECT count(*) FROM events WHERE type='model-switched'").fetchone()[0], 1)
+
+
+class OpenModelTest(unittest.TestCase):
+    """Fable at its weekly limit: a session the harness starts gets --model opus (owner, 2026-11-24)."""
+
+    def setUp(self):
+        self.saved = dict(bus._FULL)
+
+    def tearDown(self):
+        bus._FULL.clear()
+        bus._FULL.update(self.saved)
+
+    def test_fable_full_gives_opus_and_open_keeps_fable(self):
+        bus._FULL.clear(); bus._FULL['fable'] = True
+        self.assertEqual(bus.flag_of('fable'), '--model opus ')
+        self.assertEqual(bus.flag_of('opus'), '--model opus ')
+        self.assertEqual(bus.flag_of(''), '')
+        bus._FULL['fable'] = False
+        self.assertEqual(bus.flag_of('fable'), '--model fable ')
+
+
+class WakeRemoteLimitTest(DeliverBase):
+    """wake_remote: Escape on «Stop and wait», a card (no key) on the model menu, and a clear line when the resume
+    closed at once."""
+    PATCHED = DeliverBase.PATCHED + ('place_screen', 'open_cloud_tab', 'mark_woken', 'wake_no_box_note', 'time',
+                                     'polar_wake_card')
+
+    def setUp(self):
+        super().setUp()
+        bus.wake_remote = self.saved['wake_remote']
+        bus.open_cloud_tab = lambda label, name, poll=2: ('t1', 'p1')
+        bus.mark_woken = lambda *a, **k: None
+        bus.wake_no_box_note = lambda *a, **k: None
+        self.cards = []
+        bus.polar_wake_card = lambda title, ctx, plain, body=None: self.cards.append(title) or True
+        clock = [1000.0]
+        class T:
+            @staticmethod
+            def time():
+                clock[0] += 1
+                return clock[0]
+            @staticmethod
+            def sleep(s):
+                clock[0] += s
+        bus.time = T
+        self.s = {'cwd': None, 'title': 'x'}
+        self.w = [{'id': 1, 'about': 'a', 'kind': 'time', 'key': 'k'}]
+
+    def test_stop_menu_on_wake_gets_escape_then_text_goes(self):
+        screens = [LIMIT_MENU, LIMIT_MENU_GONE]
+        bus.place_screen = lambda host, place: screens.pop(0) if len(screens) > 1 else screens[0]
+        ok, line = bus.wake_remote(self.c, A, self.s, self.w, poll=0)
+        self.assertTrue(ok, line)
+        sent = [c for c in self.ssh_calls if 'send-keys' in c]
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].endswith(' Escape'))
+
+    def test_model_menu_on_wake_gets_enter_on_opus_then_text_goes(self):
+        screens = [MODEL_LIMIT_MENU, LIMIT_MENU_GONE]
+        bus.place_screen = lambda host, place: screens.pop(0) if len(screens) > 1 else screens[0]
+        ok, line = bus.wake_remote(self.c, A, self.s, self.w, poll=0)
+        self.assertTrue(ok, line)
+        sent = [c for c in self.ssh_calls if 'send-keys' in c]
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].endswith(' Enter'))
+        self.assertEqual(self.cards, [])
+
+    def test_model_menu_on_fable_row_on_wake_is_a_card_and_no_key(self):
+        bus.place_screen = lambda host, place: MODEL_LIMIT_FABLE_CURSOR
+        ok, line = bus.wake_remote(self.c, A, self.s, self.w, poll=0)
+        self.assertFalse(ok)
+        self.assertIn('model limit menu; the owner has a card', line)
+        self.assertEqual([c for c in self.ssh_calls if 'send-keys' in c], [])
+        self.assertEqual(len(self.cards), 1)
+        self.assertEqual(self.tmux_calls, [])
+
+    def test_resume_that_closed_says_so(self):
+        bus.place_screen = lambda host, place: ''
+        calls = []
+        def ssh(cmd, timeout=40):
+            calls.append(cmd)
+            if 'has-session' in cmd:
+                return (0, '') if len([c for c in calls if 'has-session' in c]) == 1 else (1, '')
+            if cmd.startswith('ls '):
+                return (2, '')
+            return (0, '')
+        bus.ssh = ssh
+        self.rc_tmux = 5
+        ok, line = bus.wake_remote(self.c, A, self.s, self.w, poll=0)
+        self.assertFalse(ok)
+        self.assertIn('closed at once', line)
+        self.assertIn('no transcript', line)
+        self.assertEqual(self.c.execute("SELECT count(*) FROM events WHERE type='resume-exited'").fetchone()[0], 1)
+
+
+class GoneSessionTest(DeliverBase):
+    """A parked server session with no tmux, no transcript and no process: the row closes once to the router and
+    its own wait is cancelled (delivery 1341, 2026-11-24)."""
+
+    def gone_ssh(self, out):
+        bus.ssh = lambda cmd, timeout=40: self.ssh_calls.append(cmd) or ((0, out) if 'gone-check' in cmd else (0, ''))
+
+    def setup_row(self):
+        self.set_session(host='server', parked_at=minutes_ago(120))
+        self.wake_res = []
+        out = bus.deliver(self.c, A, 'ok')
+        self.assertTrue(out.startswith('queued'), out)
+        with self.c:
+            self.c.execute('UPDATE deliveries SET created_at=?', (minutes_ago(45),))
+
+    def test_gone_closes_the_row_and_cancels_its_wait(self):
+        self.setup_row()
+        self.gone_ssh('gone-check\n')
+        bus.pull(self.c)
+        r = self.rows()[0]
+        self.assertIsNotNone(r['done_at'])
+        self.assertIn('no session to wake', r['outcome'])
+        self.assertEqual(len(self.inbox), 1)
+        self.assertEqual(self.c.execute('SELECT count(*) FROM waits WHERE cancelled_at IS NULL AND woken_at IS NULL '
+                                        'AND delivery_id IS NOT NULL').fetchone()[0], 0)
+        self.assertEqual(self.c.execute('SELECT count(*) FROM waits WHERE cancelled_at IS NOT NULL').fetchone()[0], 1)
+
+    def test_a_transcript_or_no_answer_keeps_the_row(self):
+        self.setup_row()
+        for out in ('gone-check\nfile\n', 'gone-check\nproc\n', ''):
+            self.gone_ssh(out)
+            bus.pull(self.c)
+            self.assertIsNone(self.rows()[0]['done_at'], out)
+        self.assertEqual(self.inbox, [])
+
+
+class DeliveryAlarmTest(DeliverBase):
+    """A message not typed after 30 min: one Polar card per session and oldest message, whatever the reason."""
+    PATCHED = DeliverBase.PATCHED + ('place_screen', 'polar_wake_card')
+
+    def setUp(self):
+        super().setUp()
+        self.cards = []
+        bus.polar_wake_card = lambda title, ctx, plain, body=None: self.cards.append((title, ctx, body)) or True
+        bus.place_screen = lambda host, place: MODEL_LIMIT_MENU
+
+    def add(self, sid, text, mins):
+        with self.c:
+            self.c.execute("INSERT INTO deliveries(session_id, host, text, ref, created_at, tries, outcome, place) "
+                           "VALUES(?,?,?,?,?,?,?,?)", (sid, 'server', text, text, bus.ago_s(mins * 60), 9,
+                                                       'queued: box is not free', 'task-wx'))
+
+    def test_one_card_per_session_then_quiet(self):
+        self.set_session(title='Caso Ejemplo')
+        self.add(A, 'ok', 45)
+        self.add(A, 'otra', 40)
+        self.add(B, 'nuevo', 5)  # younger than 30 min: no card
+        self.assertEqual(bus.delivery_alarm(self.c), [A])
+        self.assertEqual(len(self.cards), 1)
+        title, ctx, body = self.cards[0]
+        self.assertIn('Caso Ejemplo', title)
+        self.assertIn('«ok»', body)
+        self.assertIn('Switch to Opus', body)
+        self.assertIn('tmux attach -t task-wx', body)
+        self.assertEqual(bus.delivery_alarm(self.c), [])  # same oldest message: no second card
+        self.assertEqual(len(self.cards), 1)
+
+    def test_a_card_polar_did_not_take_is_tried_again_later(self):
+        bus.polar_wake_card = lambda *a, **k: False
+        self.add(A, 'ok', 45)
+        self.assertEqual(bus.delivery_alarm(self.c), [A])
+        self.assertEqual(bus.delivery_alarm(self.c), [])  # before CARD_RETRY_S
+        with self.c:
+            self.c.execute("UPDATE events SET at=? WHERE type='delivery-alarm'", (bus.ago_s(bus.CARD_RETRY_S + 5),))
+        self.assertEqual(bus.delivery_alarm(self.c), [A])
+
+    def test_pull_runs_it_only_on_the_server(self):
+        self.add(A, 'ok', 45)
+        bus.pull(self.c)  # role local in tests
+        self.assertEqual(self.cards, [])
+
+
 
 
 class DeliverTest(DeliverBase):
@@ -4690,9 +4973,12 @@ class QuestionHelpers:
             self.add_wait(A, 'task', 'one', met=True)
         ws = self.c.execute('SELECT * FROM waits').fetchall()
         marked = []
+        started = [existed]
         def ssh(cmd, timeout=40):
             if 'has-session' in cmd:
-                return (0 if existed else 1), ''
+                return (0 if started[0] else 1), ''
+            if 'new-session' in cmd:
+                started[0] = True
             if 'capture-pane' in cmd:
                 return 0, scr.read()
             if 'send-keys' in cmd:
@@ -4856,7 +5142,7 @@ class StartQuestionTest(BusBase, QuestionHelpers):
         self.assertEqual([c for c in calls if c[:2] == ('pane', 'send-text')], [])  # the text is the prompt argument
         self.assertEqual(len(polar), 1)
         card = polar[0]
-        self.assertEqual(card[:3], ['polar', 'ask', 'decision'])
+        self.assertEqual([os.path.basename(card[0])] + card[1:3], ['polar', 'ask', 'decision'])
         self.assertTrue(card[card.index('--title') + 1].startswith('Contesta la pregunta de Claude en la pestaña '))
         self.assertLessEqual(len(card[card.index('--context') + 1]), 280)
         self.assertIsNotNone(self.woken(), res)  # it runs and keeps the wake text; the owner's answer starts it
@@ -5329,7 +5615,7 @@ class TrustQuestionTest(DeliverBase, QuestionHelpers):
         self.assertEqual(self.tmux_calls, [])  # no text is typed into the question
         self.assertEqual(marked + marked2, [])
         self.assertEqual(len(polar), 1)
-        self.assertEqual(polar[0][0][:3], ['polar', 'ask', 'decision'])
+        self.assertEqual([os.path.basename(polar[0][0][0])] + polar[0][0][1:3], ['polar', 'ask', 'decision'])
         self.assertEqual(self.opt(polar[0], '--title'), 'Confirma la carpeta de una sesión en server')
         self.assertLessEqual(len(self.opt(polar[0], '--context')), 280)
         body = polar[0][1]

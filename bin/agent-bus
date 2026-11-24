@@ -67,7 +67,7 @@ Roles (~/.config/agent-bus/role, or env AGENT_BUS_ROLE):
   local   no file: bus.db on this machine (tests, rollback).
   agent-bus flush [--quiet]   (client: send the queued lines now)
 """
-import json, os, random, re, shutil, sqlite3, subprocess, sys, time, uuid
+import json, os, random, re, shlex, shutil, sqlite3, subprocess, sys, time, uuid
 from datetime import datetime, timezone, timedelta
 
 KINDS = ("pr", "thread", "topic", "branch", "initiative")
@@ -89,8 +89,39 @@ def task_model(text="", use_env=True):
     return "fable" if any(m in low for m in ("[difícil]", "[dificil]", "[fable]")) else "opus"
 
 
+_FULL = {}
+
+
+def model_is_full(m):
+    """True when the command in AGENT_BUS_MODEL_FULL_CMD (for example `claude-account model-full`; it gets the model
+    name as last argument) exits 0: the weekly limit of model `m` is used up on the live account. Asked once per
+    process; unset, a missing tool or an error counts as open (the model is kept)."""
+    if m not in _FULL:
+        cmd = (os.environ.get("AGENT_BUS_MODEL_FULL_CMD") or "").strip()
+        try:
+            if not cmd:  # no check command set: the model is kept
+                raise OSError("AGENT_BUS_MODEL_FULL_CMD is not set")
+            r = subprocess.run([os.path.expanduser(x) for x in shlex.split(cmd)] + [m], capture_output=True,
+                               text=True, timeout=10)
+            _FULL[m] = r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _FULL[m] = False
+    return _FULL[m]
+
+
+def open_model(m):
+    """The model to start with: opus instead of fable while the weekly Fable limit is used up (owner, 2026-11-24:
+    «switch automatically to opus when fable is at 100%»). Else `m`. The recorded model stays `m`, so a [difícil]
+    chain returns to fable after the reset."""
+    if m and "fable" in m.lower() and model_is_full("fable"):
+        log_line(f"model {m}: the Fable weekly limit is used up; starting on opus")
+        return "opus"
+    return m
+
+
 def flag_of(m):
-    """`--model <m> ` for a shell command line, or "" for no model."""
+    """`--model <m> ` for a shell command line, or "" for no model. Fable at its limit gives opus (open_model)."""
+    m = open_model(m)
     return f"--model {shlex_quote(m)} " if m else ""
 
 
@@ -177,7 +208,7 @@ def bus_role():
     return r if r in ("server", "client") else "local"
 
 
-SERVER_LABEL = "server"  # the sessions.host value of a session that runs on server
+SERVER_LABEL = os.environ.get("AGENT_BUS_SERVER_HOST", "server")  # the sessions.host value of a session that runs on server
 
 
 def this_host():
@@ -731,13 +762,13 @@ def client_cli(argv):
             n = flush(wait=0, settle=0.5) if "--quiet" in args else flush(wait=30)
         except BusOffline as e:
             if "--quiet" not in args:
-                print(f"agent-bus: server unreachable ({e}); {outbox_size()} bytes stay queued.", file=sys.stderr)
+                print(f"agent-bus: {SERVER_LABEL} unreachable ({e}); {outbox_size()} bytes stay queued.", file=sys.stderr)
             sys.exit(3)
         if "--quiet" not in args:
             print("a flush runs already" if n < 0 else f"sent {n}")
         return
     if cmd == "dbd":
-        sys.exit("agent-bus: dbd runs on server only (this machine is a bus client).")
+        sys.exit(f"agent-bus: dbd runs on {SERVER_LABEL} only (this machine is a bus client).")
     try:
         if outbox_size():
             flush(wait=1, budget=3)  # keeps the order; a long backlog goes on in the background
@@ -748,7 +779,7 @@ def client_cli(argv):
     except BusOffline as e:
         why = str(e)
     if _CONNECTED and cmd not in QUEUE_CMDS:
-        print(f"agent-bus: the link to server broke during `{cmd}` ({why}). Part of it may be recorded: "
+        print(f"agent-bus: the link to {SERVER_LABEL} broke during `{cmd}` ({why}). Part of it may be recorded: "
               "check with `agent-bus who` or `agent-bus waits --open` before you try again.", file=sys.stderr)
         sys.exit(3)
     if cmd in QUEUE_CMDS:
@@ -759,17 +790,17 @@ def client_cli(argv):
                 sys.exit("agent-bus: no session id (use --session or CLAUDE_SESSION_ID)")
             argv += ["--session", sid]
         outbox_append({"kind": "cli", "argv": argv, "cwd": os.getcwd()})
-        print("ok (queued: server unreachable; it is sent when server answers)")
+        print(f"ok (queued: {SERVER_LABEL} unreachable; it is sent when {SERVER_LABEL} answers)")
         return
     if cmd in SOFT_READS:
-        print(f"agent-bus: server unreachable ({why}); empty answer.", file=sys.stderr)
+        print(f"agent-bus: {SERVER_LABEL} unreachable ({why}); empty answer.", file=sys.stderr)
         print(SOFT_READS[cmd])
         return
     if cmd in ("park", "handoff"):
-        print(f"agent-bus: server unreachable ({why}). The bus cannot record the {cmd} now. "
+        print(f"agent-bus: {SERVER_LABEL} unreachable ({why}). The bus cannot record the {cmd} now. "
               "Stay open and try again in a few minutes.", file=sys.stderr)
         sys.exit(3)
-    print(f"agent-bus: server unreachable ({why}). `{cmd}` needs the bus; try again later.", file=sys.stderr)
+    print(f"agent-bus: {SERVER_LABEL} unreachable ({why}). `{cmd}` needs the bus; try again later.", file=sys.stderr)
     sys.exit(3)
 
 
@@ -868,6 +899,7 @@ PR_URL = re.compile(r"github\.com/" + re.escape(GH_ORG) + r"/([\w.-]+)/pull/(\d+
 PR_CMD = re.compile(r"gh\s+pr\s+(?:checks|view|merge|ready)\s+(\d+)")
 REPO = re.compile(r"(?:--repo|-R)[=\s]+" + re.escape(GH_ORG) + r"/([\w.-]+)")
 POLAR = re.compile(r"\bpolar\s+ask\s+(?:reply|decision|questions)\b")
+POLAR_CMD = os.environ.get("POLAR_BIN") or "polar"  # how to call polar in a shell line (ssh or sh -c)
 
 
 def tmux_name():
@@ -1107,7 +1139,7 @@ def polar_thread(row):
 
 def sync_polar(c, text=None):
     if text is None:  # on server it runs here (ssh() is role-aware)
-        text = ssh("polar list --status all --since " + ago(3), timeout=20)[1]
+        text = ssh(POLAR_CMD + " list --status all --since " + ago(3), timeout=20)[1]
     n = 0
     for line in text.splitlines():
         try:
@@ -1160,10 +1192,13 @@ def tab_position(tab_id):
 def polar_wake_card(title, context, plain, body=None):
     """One Polar decision card of the wake for the owner. `context` names the session; Polar refuses a context with
     a code in it (a session title can have one), so `plain`, a context with no session text, is the second try.
-    `body` is the card's Markdown text. Returns True when Polar took the card. Never raises."""
+    `body` is the card's Markdown text. Returns True when Polar took the card. Never raises.
+    Polar refuses a decision with fewer than 2 options (found 2026-11-24: every wake card had one, and none went out).
+    """
     for ctx in (context, plain):
         try:
-            p = subprocess.run(["polar", "ask", "decision", "--title", title, "--context", ctx, "--option", "ok:Listo",
+            p = subprocess.run([polar_bin(), "ask", "decision", "--title", title, "--context", ctx, "--option", "ok:Listo",
+                                "--option", "later:Lo veo después",
                                 "--requester", "agent-bus-wake", *(["--text-file", "-"] if body else [])],
                                input=body, capture_output=True, text=True, timeout=30)
         except Exception as e:
@@ -1171,7 +1206,7 @@ def polar_wake_card(title, context, plain, body=None):
             return False
         if p.returncode == 0:
             return True
-        log_line(f"polar card «{title}» refused ({p.returncode}): {(p.stderr or '').strip()[:200]}")
+        log_line(f"polar card «{title}» refused ({p.returncode}): {((p.stderr or '') + ' ' + (p.stdout or '')).strip()[:300]}")
     return False
 
 
@@ -1647,13 +1682,13 @@ def handoff_spawn_remote(c, old, new, s, text, ready_timeout=60, poll=2, model_t
              '"$HOME/.local/bin/claude" --session-id %s %s%s') % (new, new, mflag, shlex.quote(text))
     rc, _ = ssh(f"{SERVER_TMUX} new-session -d -s {name} -c {cdir} {shlex.quote(inner)}")
     if rc != 0:
-        return False, "ssh/tmux failed on server"
+        return False, f"ssh/tmux failed on {SERVER_LABEL}"
     tab, pane = open_cloud_tab("☁️", name, poll)
     with c:
         c.execute("UPDATE sessions SET pane=?, tmux=? WHERE session_id=?", (pane or "", name, new))
         event(c, new, "handoff-start", {"from": old, "tab": tab, "pane": pane, "tmux": name})
     log_line(f"handoff {old[:8]} -> {new[:8]} in {name}")
-    return True, f"{old} -> {new} server {name}"
+    return True, f"{old} -> {new} {SERVER_LABEL} {name}"
 
 
 def open_waits(c):
@@ -1813,7 +1848,7 @@ POLAR_OPEN = ("pending", "shown")
 
 def polar_card_status(pid):
     """(status, decided_at, chosen_option) of one Polar card, or None on failure. Tests replace this."""
-    rc, out = ssh("polar status " + shlex_quote(pid), timeout=20)
+    rc, out = ssh(POLAR_CMD + " status " + shlex_quote(pid), timeout=20)
     try:
         row = json.loads(out)
     except Exception:
@@ -1899,7 +1934,7 @@ def long_wait_card(about, first):
     when = es_when(first)
     title = clip_text(f"¿Espera hasta el {when} o avanza ya? {about}", 120)
     plain = f"Una sesión se estacionó solo por una hora fija, hasta el {when}. Nada más la despierta antes."
-    body = (f"La sesión se estacionó por: **{about}**.\n\nVuelve sola el **{when}** (en tu zona horaria). "
+    body = (f"La sesión se estacionó por: **{about}**.\n\nVuelve sola el **{when}** ({txt('tz_note')}). "
             "No espera a ninguna persona ni a producción, solo la hora.\n\n"
             "- **Que espere**: no pasa nada; vuelve en esa fecha.\n"
             "- **Que avance ya**: despierta ahora. Si no puede avanzar sin lo que esperaba, te lo dice en un informe.")
@@ -2037,7 +2072,7 @@ def short_title(title, sid):
     return (t[:28] or sid[:8])
 
 
-SERVER_HOST = os.environ.get("AGENT_BUS_SERVER_HOST", "server")
+SERVER_HOST = SERVER_LABEL
 SERVER_TMUX = os.environ.get("AGENT_BUS_SERVER_TMUX", "tmux")  # tmux binary on the server
 
 
@@ -2179,7 +2214,7 @@ def open_cloud_tab(label, name, poll=2):
 def attach_cmd(name):
     """Same line as the task runner attach_cmd: own ssh link, keepalive, a new link after a network drop."""
     return (f"until ssh -t -o ControlPath=none -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 "
-            f"{SERVER_HOST} 'tmux attach -t {name}'; [ $? -ne 255 ]; do echo 'server: link lost, new try in 5 s'; "
+            f"{SERVER_HOST} 'tmux attach -t {name}'; [ $? -ne 255 ]; do echo '{SERVER_LABEL}: link lost, new try in 5 s'; "
             "sleep 5; done; exit")
 
 
@@ -2232,12 +2267,25 @@ def wake_remote(c, sid, s, wait_rows, ready_timeout=60, poll=2, note=""):
             ssh(f'"$HOME/.local/bin/agent-bus" trust {cdir}')
         rc, _ = ssh(f"{SERVER_TMUX} new-session -d -s {name} -c {cdir} {shlex.quote(inner)}")
         if rc != 0:
-            return False, "ssh/tmux failed on server"
+            return False, f"ssh/tmux failed on {SERVER_LABEL}"
     if existed:  # an earlier wake started it: one short look, so a stuck screen does not hold every run
         ready_timeout = min(ready_timeout, 10)
     deadline = time.time() + ready_timeout
     while time.time() < deadline:
         out = place_screen(SERVER_LABEL, name)
+        key = answer_limit_screen(SERVER_LABEL, name, out)
+        if key == "model":  # «You've reached your … limit»: the model is the owner's choice; no key, one card
+            about = (wait_rows[0]["about"] if wait_rows else "") or s["title"] or sid[:8]
+            card = tell_model_limit(c, sid, about, name)
+            show_server_place(c, sid, name, poll)
+            wake_no_box_note(c, sid, name, wait_rows)
+            return False, (f"{sid} runs in {name} on {SERVER_LABEL} at the model limit menu; " +
+                           ("the owner has a card" if card else "no card went out"))
+        if key:  # «Stop and wait for limit to reset»: Escape closed it; look again
+            with c:
+                event(c, sid, "limit-menu-closed", {"place": name, "key": key, "wake": True})
+            time.sleep(poll)
+            continue
         if question_kind(out):
             time.sleep(poll)  # a second look: a resumed session can show a quoted question before its input box
             out = place_screen(SERVER_LABEL, name)
@@ -2247,10 +2295,10 @@ def wake_remote(c, sid, s, wait_rows, ready_timeout=60, poll=2, note=""):
                 if kind == "trust":
                     card = tell_trust_question(c, sid, about, trust_folder_on_screen(out) or (cwd or ""), name)
                 else:
-                    card = tell_start_question(c, sid, "una sesión de server", about, name)
+                    card = tell_start_question(c, sid, f"una sesión de {SERVER_LABEL}", about, name)
                 show_server_place(c, sid, name, poll)  # the owner answers it there
                 wake_no_box_note(c, sid, name, wait_rows)  # a question that stays, or a card that did not go out
-                return False, (f"{sid} runs in {name} on server at {QUESTION_WORDS[kind]}; " +
+                return False, (f"{sid} runs in {name} on {SERVER_LABEL} at {QUESTION_WORDS[kind]}; " +
                                ("the owner has a card" if card else "no card went out"))
             continue
         if claude_ready(out):
@@ -2264,25 +2312,47 @@ def wake_remote(c, sid, s, wait_rows, ready_timeout=60, poll=2, note=""):
             break
         time.sleep(30 if poll else 0)
         rc = deliver_tmux(name, (note + text) if note else text)
+    if rc not in (0, 4, 7):
+        key = answer_limit_screen(SERVER_LABEL, name)
+        if key == "model":
+            about = (rows[0]["about"] if rows else "") or s["title"] or sid[:8]
+            card = tell_model_limit(c, sid, about, name)
+            wake_no_box_note(c, sid, name, rows)
+            return False, (f"{sid} runs in {name} on {SERVER_LABEL} at the model limit menu; " +
+                           ("the owner has a card" if card else "no card went out"))
+        if key:  # the «Stop and wait» menu came up after the ready look: Escape closed it; type once more
+            with c:
+                event(c, sid, "limit-menu-closed", {"place": name, "key": key, "wake": True})
+            time.sleep(poll)
+            rc = deliver_tmux(name, (note + text) if note else text)
+    if rc not in (0, 4, 7) and ssh(f"{SERVER_TMUX} has-session -t '={name}' 2>/dev/null")[0] != 0:
+        # the resume closed at once: no tmux, so no box will ever come. Say why (2026-11-24: 9c10d6af had no
+        # transcript on server and the bus said «box is not free» for hours)
+        found = ssh(f"ls \"$HOME\"/.claude/projects/*/{sid}.jsonl >/dev/null 2>&1")[0] == 0
+        why = "the resume closed at once" + ("" if found else f"; no transcript of it on {SERVER_LABEL}")
+        with c:
+            event(c, sid, "resume-exited", {"place": name, "transcript": found})
+        log_line(f"{sid[:8]}: {why}")
+        return False, f"{sid}: {why} ({name} is gone)"
     if rc not in (0, 4, 7):  # the session still counts as parked; its tmux stays for the next wake
         log_line(f"started {sid[:8]} in {name}, but the resume text was not typed (herdr-deliver {rc}); next wake")
         wake_no_box_note(c, sid, name, rows)
-        return False, f"{sid} runs in {name} on server, but its box is not free (herdr-deliver {rc}); next wake types it"
+        return False, f"{sid} runs in {name} on {SERVER_LABEL}, but its box is not free (herdr-deliver {rc}); next wake types it"
     label = "☁️"  # herdr-renumber adds the position number
     tab, pane = open_cloud_tab(label, name, poll)
     w = rows[0]
     mark_woken(c, sid, rows, {"pane": pane, "tmux": name},
                {"tab": tab, "pane": pane, "wait": w["id"], "summary": summ, "tmux": name, "live": existed}, t0)
     log_line(f"resumed {label}: {w['about']} ({w['kind']} {w['key']})")
-    return True, f"{sid} -> server {name}" + (f" tab {tab}" if tab else " (no laptop tab)")
+    return True, f"{sid} -> {SERVER_LABEL} {name}" + (f" tab {tab}" if tab else " (no laptop tab)")
 
 
 MOVE_ORG = GH_ORG + "/"   # product repos may move to server; personal repos stay on the laptop
-MOVE_NOTE = ("You now run on server (moved from the laptop to free its memory). Same folder and branch. "
+MOVE_NOTE = (f"You now run on {SERVER_LABEL} (moved from the laptop to free its memory). Same folder and branch. "
              "node_modules may be missing: run the repo install before builds or tests. The laptop's Chrome "
              "answers here only while the laptop is awake and this machine's Claude account is the account of the "
              "extension: when no browser is listed, or for a laptop-only step, use `polar handoff`. Vercel and "
-             "CLI tools need no browser here.")
+             + (os.environ.get("AGENT_BUS_MOVE_NOTE_TOOLS") or "CLI tools need no browser here."))
 
 
 def git_out(cwd, *a, timeout=20):
@@ -2563,9 +2633,9 @@ def move_staged(c, sid, s):
     path = st.get("path") or ""
     try:
         if os.path.getsize(path) != st.get("size"):
-            why = "the transcript on server differs from the laptop one"
+            why = f"the transcript on {SERVER_LABEL} differs from the laptop one"
     except (OSError, TypeError):
-        why = "no transcript on server"
+        why = f"no transcript on {SERVER_LABEL}"
     final = bool(why)  # a transcript problem stays; a prepare failure (network, GitHub) may pass on a later try
     if not why:
         def renew():
@@ -2844,13 +2914,108 @@ def limit_menu(out):
     return any("esc to cancel" in l.lower() for l in lines[at[-1] + 2:at[-1] + 7])
 
 
-def close_limit_menu(host, place):
-    """When the model limit menu holds this place, press Escape there (no option is chosen). True when a key went."""
-    if not limit_menu(place_screen(host, place)):
+# «You've reached your Fable limit» (weekly limit of one model) opens another menu: «❯ Switch to Opus 5.5 and continue»
+# / «Continue with Fable 5.2» (usage credits: money). On 2026-11-24 five sessions sat at it for hours, and the owner
+# only saw it in a terminal. Since the owner's rule of 2026-11-24 (see SWITCH_TO_OPUS) the bus presses Enter when the
+# cursor is on «Switch to Opus»; the text below is the earlier rule, kept for any other cursor row.
+# The choice of model is the owner's (no key at a Claude question, 3f1fff7): the bus
+# presses no key here, and the owner gets one Polar card at once. Polar tasks and bus resumes start on Opus since
+# 2026-11-24, so this menu should be rare. Screen of Claude Code 2.1.331, read on server.
+MODEL_LIMIT_TITLE = re.compile(r"You've reached your [\w .-]{1,30} limit")
+
+
+def model_limit_menu(out):
+    """The «You've reached your <model> limit» menu is open on this screen. Like limit_menu: no input box, the title is the last one on screen, its option rows follow, and the
+    «Esc to cancel» hint closes it."""
+    out = out or ""
+    if not MODEL_LIMIT_TITLE.search(out) or has_input_box(out):
         return False
+    lines = [l for l in out.splitlines() if l.strip()]
+    at = [i for i, l in enumerate(lines) if MODEL_LIMIT_TITLE.search(l)]
+    rest = lines[at[-1] + 1:at[-1] + 9]
+    hint = next((i for i, l in enumerate(rest) if "esc to cancel" in l.lower()), None)
+    if hint is None:
+        return False
+    rows = [QUESTION_OPTION.match(l) for l in rest[:hint]]
+    cursor = [m.group(2) for m in rows if m.group(1)]
+    return len(cursor) == 1
+
+
+def press_key(host, place, key):
     if (host or "local") == SERVER_LABEL:
-        return ssh(f"{SERVER_TMUX} send-keys -t {tmux_pane(place)} Escape")[0] == 0
-    return herdr("pane", "send-keys", place, "Escape") is not None
+        return ssh(f"{SERVER_TMUX} send-keys -t {tmux_pane(place)} {key}")[0] == 0
+    return herdr("pane", "send-keys", place, key) is not None
+
+
+def model_limit_cursor(out):
+    """The text of the cursor row of an open «You've reached your … limit» menu, or None when no such menu is open."""
+    if not model_limit_menu(out):
+        return None
+    lines = [l for l in (out or "").splitlines() if l.strip()]
+    at = [i for i, l in enumerate(lines) if MODEL_LIMIT_TITLE.search(l)]
+    for l in lines[at[-1] + 1:at[-1] + 9]:
+        m = QUESTION_OPTION.match(l)
+        if m and m.group(1):
+            return m.group(2).strip()
+    return None
+
+
+# Owner, 2026-11-24: «make the switch automatically to opus when fable is at 100%». So at the model limit menu the
+# bus presses Enter only when the cursor row is «Switch to Opus … and continue» (no cost). Any other cursor row
+# («Continue with Fable» uses paid credits, or a menu the bus does not know) gets no key and one card.
+SWITCH_TO_OPUS = re.compile(r"^(?:\d+\.\s*)?Switch to Opus\b.*\bcontinue\b", re.I)
+
+
+def answer_limit_screen(host, place, out=None):
+    """«What do you want to do? ❯ 1. Stop and wait…» holds this place: press Escape (no option is chosen). The
+    «You've reached your … limit» menu with the cursor on «Switch to Opus … and continue»: press Enter. Returns
+    "escape", "opus", "model" (another model limit menu, or Enter failed: no key, the owner chooses) or ""."""
+    out = place_screen(host, place) if out is None else out
+    if limit_menu(out):
+        return "escape" if press_key(host, place, "Escape") else ""
+    row = model_limit_cursor(out)
+    if row is not None:
+        if SWITCH_TO_OPUS.search(row) and press_key(host, place, "Enter"):
+            log_line(f"{place}: model limit menu; Enter on «{row}»")
+            return "opus"
+        return "model"
+    return ""
+
+
+def model_limit_sweep(c):
+    """server: every tmux session whose screen shows the model limit menu with the cursor on «Switch to Opus»
+    gets Enter, also when no message waits for it (a running Fable session that reached the limit mid-task). One
+    ssh call finds the screens; a screen that only quotes the title is not a menu (model_limit_menu). Returns the
+    names switched."""
+    rc, out = ssh(f"for s in $({SERVER_TMUX} list-sessions -F '#S' 2>/dev/null); do "
+                  f"{SERVER_TMUX} capture-pane -p -t \"=$s:\" 2>/dev/null | grep -qF 'reached your' && echo \"$s\"; "
+                  f"done; true")
+    done = []
+    for name in (out or "").split() if rc == 0 else []:
+        if answer_limit_screen(SERVER_LABEL, name) == "opus":
+            done.append(name)
+            sid = name[len("task-w"):] if name.startswith("task-w") else ""
+            row = c.execute("SELECT session_id FROM sessions WHERE session_id LIKE ? LIMIT 1",
+                            (sid + "%",)).fetchone() if len(sid) >= 8 else None
+            with c:
+                event(c, row["session_id"] if row else "", "model-switched", {"place": name, "to": "opus"})
+    return done
+
+
+def tell_model_limit(c, sid, about, place, host=SERVER_LABEL):
+    """One Polar card for a session at «You've reached your … limit» (card_once gives the result). No key."""
+    where = attach_line(place) if host == SERVER_LABEL else "- Dónde: en la pestaña de esa sesión."
+    body = ("La sesión llegó al límite semanal de su modelo y Claude pregunta qué hacer. El bus no elige: es tu "
+            "decisión.\n\n" + where + "\n- Sin costo: «Switch to Opus … and continue»; presiona Enter si el cursor "
+            "está ahí.\n- «Continue with Fable» usa créditos pagados.\n- Los mensajes en espera entran solos después.\n")
+    return card_once(c, sid, "model-limit-card", lambda: polar_wake_card(
+        "Una sesión llegó al límite de su modelo", f"{clip_text(about, 120)}: espera que elijas modelo.",
+        "Una sesión espera que elijas modelo.", body))
+
+
+def close_limit_menu(host, place):
+    """When the «Stop and wait» limit menu holds this place, press Escape there. True when a key went."""
+    return answer_limit_screen(host, place) == "escape"
 
 
 def start_question(out):
@@ -2962,9 +3127,46 @@ def card_sent(c, sid, typ, sent):
         log_line(f"card record {typ} for {sid[:8]} failed: {e}")
 
 
+# The few fixed owner-facing texts that differ by language. AGENT_BUS_LANG=en (default) or es. Every other text of
+# this tool stays as it is (English in logs and outcomes, Spanish in the Polar cards).
+LANG = (os.environ.get("AGENT_BUS_LANG") or "en").strip().lower()
+TEXTS = {
+    "en": {
+        "attach_line": "- Where: its ☁️ tab, if your laptop opened it. Or run `ssh -t {host} tmux attach -t {place}`.",
+        "two_copies_title": "Two copies of one session: ",
+        "two_copies_body": "The server took this session while the laptop did not answer, but its laptop copy "
+                           "was used afterwards. I did not close the laptop tab. Decide which one stays and close "
+                           "the other.",
+        "took_over_title": "Continues on the server: ",
+        "took_over_body": "The laptop did not answer (lid closed or asleep) and a message arrived for this session. "
+                          "It continues on the server with its history and the message.\n\nWhen the laptop opens, its "
+                          "old tab there closes by itself.",
+        "tz_note": "en tu zona horaria",
+    },
+    "es": {
+        "attach_line": "- Dónde: su pestaña ☁️, si tu laptop la abrió. O entra con `ssh -t {host} tmux attach -t {place}`.",
+        "two_copies_title": "Dos copias de una sesión: ",
+        "two_copies_body": "{server} tomó esta sesión mientras la laptop no respondía, pero su copia en la "
+                           "laptop se usó después. No cerré la pestaña de la laptop. Decide cuál sigue y cierra "
+                           "la otra.",
+        "took_over_title": "Sigue en {server}: ",
+        "took_over_body": "La laptop no respondía (tapa cerrada o dormida) y llegó un mensaje para esta sesión. "
+                          "Sigue en {server} con su historial y el mensaje.\n\nAl abrir la laptop, su pestaña "
+                          "vieja allí se cierra sola.",
+        "tz_note": "hora de Ciudad de México",
+    },
+}
+
+
+def txt(key, **kw):
+    """One fixed text in the language of AGENT_BUS_LANG (unknown language: en)."""
+    t = TEXTS.get(LANG, TEXTS["en"])[key]
+    return t.format(server=SERVER_LABEL, **kw) if kw or "{server}" in t else t
+
+
 def attach_line(place):
     """The body line that says how to open a server session by hand (the owner may have no ☁️ tab for it)."""
-    return f"- Where: its ☁️ tab, if your laptop opened it. Or run `ssh -t {SERVER_HOST} tmux attach -t {place}`."
+    return txt("attach_line", host=SERVER_HOST, place=place)
 
 
 def tell_start_question(c, sid, where, about, place=None):
@@ -2989,7 +3191,7 @@ def tell_trust_question(c, sid, about, folder, place=None, label=None):
             "después.\n"
             f"- Para no reanudarla: `agent-bus unpark {sid}`.\n")
     title = (f"Confirma la carpeta de {label}" if label else
-             "Confirma la carpeta de una sesión en server" if place else "Confirma la carpeta de una sesión")
+             f"Confirma la carpeta de una sesión en {SERVER_LABEL}" if place else "Confirma la carpeta de una sesión")
     return card_once(c, sid, "trust-question-card", lambda: polar_trust_card("", about, title=title, body=body))
 
 
@@ -3017,7 +3219,7 @@ def wake_no_box_note(c, sid, name, rows):
         if told_at(c, sid, "wake-no-box"):
             return False
         tail = " / ".join(l.strip() for l in place_screen(SERVER_LABEL, name).splitlines() if l.strip())[-300:]
-        router_note(c, f"- {now()} agent-bus wake: session {sid} runs in {name} on server, but it shows no input "
+        router_note(c, f"- {now()} agent-bus wake: session {sid} runs in {name} on {SERVER_LABEL}, but it shows no input "
                        f"box {DELIVERY_NO_BOX_MIN} min after its wait was met, so its resume text is not typed. The "
                        f"bus keeps trying. Tell the owner: he can open it with `ssh -t {SERVER_HOST} tmux attach -t "
                        f"{name}`. Screen now: {tail or '(empty)'}")
@@ -3524,7 +3726,7 @@ def recent_resumes(c):
     return n
 
 
-WAKE_HELD = ("trust-question-card", "start-question-card", "wake-no-box")
+WAKE_HELD = ("trust-question-card", "start-question-card", "wake-no-box", "model-limit-card")
 
 
 def wake_held(c, sid):
@@ -3637,9 +3839,9 @@ def tell_laptop_wait(c, sid, w):
     s = c.execute("SELECT title, cwd FROM sessions WHERE session_id=?", (sid,)).fetchone()
     st = stage_of(w)
     why = st.get("why") or ("trabajó en la laptop después de prepararse" if st.get("ok") else
-                            "no se preparó para server al cerrar")
+                            f"no se preparó para {SERVER_LABEL} al cerrar")
     label = clip_text((s["title"] if s else None) or "sesión sin título", 60)
-    body = (f"La espera de esta sesión se cumplió ({clip_text(w['about'] or w['kind'], 120)}), pero server no "
+    body = (f"La espera de esta sesión se cumplió ({clip_text(w['about'] or w['kind'], 120)}), pero {SERVER_LABEL} no "
             f"puede seguirla: {why}.\n\nLa laptop la abre cuando esté encendida. Si debe seguir antes, abre la "
             "laptop.")
     ok = polar_notice("Espera la laptop: " + label, body, sid)
@@ -3780,17 +3982,15 @@ def reap_taken_over(c, panes=None, agents=None):
         if a.get("agent_status") not in ("idle", "done") or size != stage_of(s).get("size"):
             with c:
                 event(c, sid, "two-copies", {"pane": pane, "status": a.get("agent_status"), "size": size})
-            laptop_polar_notice("Two copies of one session: " + clip_text(a.get("terminal_title_stripped") or sid[:8], 50),
-                                "The server took this session while the laptop did not answer, but its laptop copy "
-                                "was used afterwards. I did not close the laptop tab. Decide which one stays and close "
-                                "the other.", sid)
+            laptop_polar_notice(txt("two_copies_title") + clip_text(a.get("terminal_title_stripped") or sid[:8], 50),
+                                txt("two_copies_body"), sid)
             continue
         tab = tab_of_pane(pane)
         if tab:
             herdr("tab", "close", tab)
         with c:
             event(c, sid, "laptop-copy-closed", {"pane": pane, "tab": tab})
-        log_line(f"closed the laptop copy of {sid[:8]} ({pane}): server took it over")
+        log_line(f"closed the laptop copy of {sid[:8]} ({pane}): {SERVER_LABEL} took it over")
         out.append(sid)
     return out
 
@@ -3824,7 +4024,7 @@ POLAR_SILENT = "--silent"  # Polar report flag: stored and shown in Mando, no Sl
 
 def polar_notice(title, body, sid, silent=False):
     """server: one Polar report card. `silent`: information only, no Slack DM. True when sent."""
-    cmd = ("polar report --title " + shlex_quote(title) + " --text-file - --requester "
+    cmd = (POLAR_CMD + " report --title " + shlex_quote(title) + " --text-file - --requester "
            + shlex_quote(sid) + (" " + POLAR_SILENT if silent else ""))
     try:
         p = subprocess.run(["/bin/sh", "-c", cmd], input=body, capture_output=True, text=True, timeout=40)
@@ -3836,10 +4036,7 @@ def polar_notice(title, body, sid, silent=False):
 def tell_taken_over(c, sid):
     s = c.execute("SELECT title FROM sessions WHERE session_id=?", (sid,)).fetchone()
     label = clip_text((s["title"] if s else None) or "sesión sin título", 60)
-    ok = polar_notice("Continues on the server: " + label,
-                      "The laptop did not answer (lid closed or asleep) and a message arrived for this session. "
-                      "It continues on the server with its history and the message.\n\nWhen the laptop opens, its "
-                      "old tab there closes by itself.", sid, silent=True)  # information only
+    ok = polar_notice(txt("took_over_title") + label, txt("took_over_body"), sid, silent=True)  # information only
     with c:
         event(c, sid, "taken-over-told", {"sent": ok})
     return ok
@@ -4074,6 +4271,17 @@ def _delivery_try(c, d, again=False):
         w = own_wait(c, did)
         if w and w["woken_at"] and w["session_id"] == sid:
             return True, f"met {kind}:{key} of {sid[:8]}; " + "; ".join(res)
+        if (host == SERVER_LABEL and older_than(d["created_at"], DELIVERY_NO_BOX_MIN * 60)
+                and not any(r.startswith("later:") for r in res) and server_session_gone(sid)):
+            # 2026-11-24: delivery 1341 tried 740+ times for a session with no transcript, tmux or process on
+            # server, and its met wait made every wake try again. Tell the router once, close the row, cancel
+            # its own wait.
+            with c:
+                c.execute("UPDATE waits SET cancelled_at=? WHERE delivery_id=? AND woken_at IS NULL AND "
+                          "cancelled_at IS NULL", (now(), did))
+                event(c, sid, "delivery-no-session", {"delivery": did})
+            return True, delivery_to_router(c, d, "no session to wake: no transcript, no tmux and no process of it "
+                                                  f"on {SERVER_LABEL}")
         return False, (f"queued {did}: met {kind}:{key} of {sid[:8]}; " +
                        ("; ".join(res) or "nothing to wake now (another resume runs?)"))
     if not can_type(host):
@@ -4113,10 +4321,16 @@ def _delivery_try(c, d, again=False):
         return False, f"queued {did}: herdr-deliver did not run"
     # 5 (or any other code): no Claude Code input box on screen. A menu or a question goes away; a gone place does not.
     alive = place_alive(host, place)
-    if alive and close_limit_menu(host, place):
+    key = answer_limit_screen(host, place) if alive else ""
+    if key == "model":
+        card = tell_model_limit(c, sid, s["title"] or sid[:8], place, host)
+        return False, (f"queued {did}: «You've reached your … limit» holds {place}; no key; " +
+                       ("the owner has a Polar card for it" if card else "no card went out"))
+    if key:
         with c:
-            event(c, sid, "limit-menu-closed", {"delivery": did, "place": place})
-        return False, f"queued {did}: the model limit menu held {place}; Escape closed it (no option chosen); next try soon"
+            event(c, sid, "limit-menu-closed", {"delivery": did, "place": place, "key": key})
+        what = "Enter chose «Switch to Opus»" if key == "opus" else "Escape closed it (no option chosen)"
+        return False, f"queued {did}: a limit menu held {place}; {what}; next try soon"
     if alive:
         kind, card = question_on_place(c, sid, host, place, s["title"] or sid[:8])
         holds = (f"{QUESTION_WORDS[kind]} holds it; " + ("the owner has a Polar card for it" if card else
@@ -4201,7 +4415,7 @@ def pull(c, max_n=5, budget=60.0):
         try:
             laptop_heartbeat(c)
             for sid in reap_taken_over(c):
-                out.append(f"closed laptop copy of {sid[:8]}: server took it over")
+                out.append(f"closed laptop copy of {sid[:8]}: {SERVER_LABEL} took it over")
             stage_idle(c)
         except BusOffline:
             raise
@@ -4251,7 +4465,89 @@ def pull(c, max_n=5, budget=60.0):
         out.append(f"{d['id']} {line}")
         if not done and d["session_id"]:
             blocked.add(d["session_id"])
+    if role == "server":
+        try:
+            for name in model_limit_sweep(c):
+                out.append(f"{name}: model limit menu; switched to Opus")
+        except Exception as e:
+            log_line(f"model limit sweep: {e}")
+        try:
+            delivery_alarm(c)
+        except Exception as e:
+            log_line(f"delivery alarm: {e}")
     return out
+
+
+def server_session_gone(sid):
+    """True only when server answers and has no tmux task-w<sid8>, no transcript and no process of `sid`.
+    No answer (ssh down) is not «gone»."""
+    pat = f"[{sid[0]}]{sid[1:]}"  # a bracket, so pgrep does not find this shell's own command line
+    rc, out = ssh(f"echo gone-check; {SERVER_TMUX} has-session -t '=task-w{sid[:8]}' 2>/dev/null && echo tmux; "
+                  f"ls \"$HOME\"/.claude/projects/*/{sid}.jsonl >/dev/null 2>&1 && echo file; "
+                  f"pgrep -f '{pat}' >/dev/null 2>&1 && echo proc; true")
+    words = (out or "").split()
+    return rc == 0 and words[:1] == ["gone-check"] and not ({"tmux", "file", "proc"} & set(words))
+
+
+DELIVERY_ALARM_MIN = 30   # min: a message for a session not typed by then -> one Polar card to the owner
+DELIVERY_ALARM_MAX = 3    # cards in one pull at most
+
+
+def delivery_alarm(c, now_s=None):
+    """The loud fail (owner, 2026-11-24: «I should know if something is failing. it should loudly fail»). Any message
+    for a session that is still not typed DELIVERY_ALARM_MIN after it came gets ONE Polar card per session and per
+    oldest open message, whatever the reason: a menu, a question, a resume that closed, a bug. On 2026-11-24 five
+    sessions held the owner's answers for hours and he only saw it in a terminal. Returns the session ids told."""
+    rows = [dict(r) for r in c.execute(
+        "SELECT * FROM deliveries WHERE done_at IS NULL AND session_id<>'' AND created_at<? ORDER BY id",
+        (ago_s(DELIVERY_ALARM_MIN * 60),))]
+    by = {}
+    for d in rows:
+        by.setdefault(d["session_id"], []).append(d)
+    told = []
+    for sid, ds in by.items():
+        if len(told) >= DELIVERY_ALARM_MAX:
+            break
+        first = ds[0]["id"]
+        seen = False
+        for r in c.execute("SELECT at, data FROM events WHERE session_id=? AND type='delivery-alarm' ORDER BY at DESC",
+                           (sid,)):
+            try:
+                dd = json.loads(r["data"] or "{}")
+            except ValueError:
+                dd = {}
+            if dd.get("delivery") == first and (dd.get("sent", True) or not older_than(r["at"], CARD_RETRY_S)):
+                seen = True
+                break
+        if seen:
+            continue
+        s = c.execute("SELECT title FROM sessions WHERE session_id=?", (sid,)).fetchone()
+        title = (s["title"] if s else "") or sid[:8]
+        d0 = ds[0]
+        host = d0["host"] or SERVER_LABEL
+        place = d0["place"] or ("task-w" + sid[:8] if host == SERVER_LABEL else "")
+        screen = ""
+        if place:
+            try:
+                screen = "\n".join([l for l in (place_screen(host, place) or "").splitlines() if l.strip()][-12:])
+            except Exception:
+                screen = ""
+        msgs = "\n".join(f"- «{flat(d['text'] or '', 160)}» ({d['tries'] or 0} intentos)" for d in ds[:5])
+        body = (f"Tengo {len(ds)} mensaje(s) para esta sesión sin entregar desde hace más de {DELIVERY_ALARM_MIN} min. "
+                "El bus sigue intentando, pero algo la bloquea.\n\n"
+                f"**Sesión:** {clip_text(title, 120)}\n\n**Mensajes en espera:**\n{msgs}\n\n"
+                f"**Último resultado del bus:** `{flat(d0['outcome'] or 'sin intento todavía', 240)}`\n\n" +
+                (attach_line(place) + "\n\n" if place and host == SERVER_LABEL else "") +
+                (f"**Lo que muestra la pantalla:**\n```\n{screen}\n```\n" if screen else "**Pantalla:** no la pude leer.\n") +
+                f"\nSi el bus no los entrega en {DELIVERY_EXPIRE_DAYS} días, pasan al router.\n")
+        sent = polar_wake_card(f"Mensajes sin entregar: {clip_text(title, 60)}",
+                               f"{clip_text(title, 120)}: tus mensajes no entran desde hace más de {DELIVERY_ALARM_MIN} min.",
+                               f"Una sesión no recibe tus mensajes desde hace más de {DELIVERY_ALARM_MIN} min.", body)
+        with c:
+            event(c, sid, "delivery-alarm", {"delivery": first, "sent": bool(sent), "count": len(ds)})
+        log_line(f"delivery alarm {sid[:8]}: {len(ds)} open, card {'sent' if sent else 'NOT sent'}")
+        told.append(sid)
+    return told
 
 
 # ---- CLI --------------------------------------------------------------------
