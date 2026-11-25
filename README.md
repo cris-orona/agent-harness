@@ -10,6 +10,8 @@ software factory: many workers, one human who decides.
 Status: extracted from a personal setup. It works for me. Expect to adapt it: paths, hosts, and some message texts
 are mine. Some card texts are still partly in Spanish (see "Known rough edges").
 
+The story behind it: [How I run a software factory of coding agents](https://crisorona.me/blog/software-factory.html).
+
 ## The loop
 
 ```
